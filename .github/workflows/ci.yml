@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Debug
+            build-dir: build-ci-debug
+            build-type: Debug
+            cmake-args: ""
+          - name: Release
+            build-dir: build-ci-release
+            build-type: Release
+            cmake-args: ""
+          - name: ASAN UBSAN
+            build-dir: build-ci-sanitize
+            build-type: Debug
+            cmake-args: "-DEIGENBOOK_ENABLE_ASAN=ON -DEIGENBOOK_ENABLE_UBSAN=ON"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B "${{ matrix.build-dir }}"
+          -DCMAKE_BUILD_TYPE=${{ matrix.build-type }}
+          ${{ matrix.cmake-args }}
+
+      - name: Build tests, examples, and benchmarks
+        run: cmake --build "${{ matrix.build-dir }}" --parallel
+
+      - name: Run tests
+        run: ctest --test-dir "${{ matrix.build-dir }}" --output-on-failure
