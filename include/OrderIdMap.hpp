@@ -3,6 +3,7 @@
 #include "Order.hpp"
 #include "Types.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -25,62 +26,82 @@ public:
     OrderIdMap(OrderIdMap&&) = delete;
     OrderIdMap& operator=(OrderIdMap&&) = delete;
 
+    void clear() noexcept
+    {
+        for (std::uint32_t i = 0; i < capacity_; ++i) {
+            entries_[i] = Entry{};
+        }
+        size_ = 0;
+        tombstones_ = 0;
+        last_probe_count_ = 0;
+        probe_histogram_.fill(0);
+    }
+
     [[nodiscard]] Status can_insert(const OrderId id) const noexcept
     {
         if (id == kInvalidOrderId) {
             return Status::InvalidOrderId;
         }
 
-        bool found_deleted = false;
-        for (std::uint32_t probe = 0; probe < capacity_; ++probe) {
-            const Entry& entry = entries_[(hash(id) + probe) & mask_];
-            if (entry.state == SlotState::Empty) {
-                return Status::Accepted;
-            }
-            if (entry.state == SlotState::Deleted) {
-                found_deleted = true;
-                continue;
-            }
-            if (entry.id == id) {
-                return Status::DuplicateOrderId;
-            }
+        std::uint32_t probes = 0;
+        if (find_index(id, probes) != kInvalidIndex) {
+            return Status::DuplicateOrderId;
         }
 
-        return found_deleted ? Status::Accepted : Status::OrderIdMapFull;
+        return size_ < capacity_ ? Status::Accepted : Status::OrderIdMapFull;
     }
 
-    [[nodiscard]] Status insert(const OrderId id, Order* order) noexcept
+    [[nodiscard]] Status insert(const OrderId id, Order* const order) noexcept
     {
         if (id == kInvalidOrderId || order == nullptr) {
+            record_probe_count(0);
             return Status::InvalidOrderId;
         }
 
-        std::uint32_t first_deleted = kInvalidIndex;
-        for (std::uint32_t probe = 0; probe < capacity_; ++probe) {
-            const std::uint32_t index = (hash(id) + probe) & mask_;
-            Entry& entry = entries_[index];
+        std::uint32_t duplicate_probes = 0;
+        if (find_index(id, duplicate_probes) != kInvalidIndex) {
+            record_probe_count(duplicate_probes);
+            return Status::DuplicateOrderId;
+        }
 
-            if (entry.state == SlotState::Occupied && entry.id == id) {
-                return Status::DuplicateOrderId;
-            }
+        if (size_ == capacity_) {
+            record_probe_count(duplicate_probes);
+            return Status::OrderIdMapFull;
+        }
 
-            if (entry.state == SlotState::Deleted && first_deleted == kInvalidIndex) {
-                first_deleted = index;
-                continue;
-            }
+        Entry incoming{};
+        incoming.id = id;
+        incoming.order = order;
+        incoming.state = SlotState::Occupied;
+        incoming.probe_distance = 0;
 
-            if (entry.state == SlotState::Empty) {
-                const std::uint32_t target = first_deleted == kInvalidIndex ? index : first_deleted;
-                place(target, id, order);
+        std::uint32_t slot = hash(id);
+        std::uint32_t probes = 0;
+        for (std::uint32_t step = 0; step < capacity_; ++step) {
+            ++probes;
+            Entry& entry = entries_[slot];
+
+            if (entry.state == SlotState::Empty || entry.state == SlotState::Deleted) {
+                if (entry.state == SlotState::Deleted) {
+                    --tombstones_;
+                }
+                entry = incoming;
+                ++size_;
+                record_probe_count(probes);
                 return Status::Accepted;
             }
+
+            if (entry.probe_distance < incoming.probe_distance) {
+                std::swap(entry, incoming);
+            }
+
+            slot = (slot + 1U) & mask_;
+            if (incoming.probe_distance != std::numeric_limits<std::uint32_t>::max()) {
+                ++incoming.probe_distance;
+            }
         }
 
-        if (first_deleted != kInvalidIndex) {
-            place(first_deleted, id, order);
-            return Status::Accepted;
-        }
-
+        record_probe_count(probes);
         return Status::OrderIdMapFull;
     }
 
@@ -92,44 +113,38 @@ public:
     [[nodiscard]] const Order* find(const OrderId id) const noexcept
     {
         if (id == kInvalidOrderId) {
+            record_probe_count(0);
             return nullptr;
         }
 
-        for (std::uint32_t probe = 0; probe < capacity_; ++probe) {
-            const Entry& entry = entries_[(hash(id) + probe) & mask_];
-            if (entry.state == SlotState::Empty) {
-                return nullptr;
-            }
-            if (entry.state == SlotState::Occupied && entry.id == id) {
-                return entry.order;
-            }
-        }
-
-        return nullptr;
+        std::uint32_t probes = 0;
+        const std::uint32_t index = find_index(id, probes);
+        record_probe_count(probes);
+        return index == kInvalidIndex ? nullptr : entries_[index].order;
     }
 
     [[nodiscard]] bool erase(const OrderId id) noexcept
     {
         if (id == kInvalidOrderId) {
+            record_probe_count(0);
             return false;
         }
 
-        for (std::uint32_t probe = 0; probe < capacity_; ++probe) {
-            Entry& entry = entries_[(hash(id) + probe) & mask_];
-            if (entry.state == SlotState::Empty) {
-                return false;
-            }
-            if (entry.state == SlotState::Occupied && entry.id == id) {
-                entry.id = kInvalidOrderId;
-                entry.order = nullptr;
-                entry.state = SlotState::Deleted;
-                --size_;
-                ++tombstones_;
-                return true;
-            }
+        std::uint32_t probes = 0;
+        const std::uint32_t index = find_index(id, probes);
+        record_probe_count(probes);
+        if (index == kInvalidIndex) {
+            return false;
         }
 
-        return false;
+        Entry& entry = entries_[index];
+        entry.id = kInvalidOrderId;
+        entry.order = nullptr;
+        entry.state = SlotState::Deleted;
+        entry.probe_distance = 0;
+        --size_;
+        ++tombstones_;
+        return true;
     }
 
     [[nodiscard]] std::uint32_t capacity() const noexcept
@@ -145,6 +160,16 @@ public:
     [[nodiscard]] std::uint32_t tombstones() const noexcept
     {
         return tombstones_;
+    }
+
+    [[nodiscard]] bool full() const noexcept
+    {
+        return size_ == capacity_;
+    }
+
+    [[nodiscard]] OrderIdMapStats stats() const noexcept
+    {
+        return OrderIdMapStats{size_, capacity_, tombstones_, last_probe_count_, probe_histogram_};
     }
 
     [[nodiscard]] static constexpr std::uint32_t capacity_for(const std::uint32_t requested_capacity) noexcept
@@ -163,6 +188,7 @@ private:
     struct Entry final {
         OrderId id{kInvalidOrderId};
         Order* order{nullptr};
+        std::uint32_t probe_distance{0};
         SlotState state{SlotState::Empty};
     };
 
@@ -171,6 +197,8 @@ private:
     std::unique_ptr<Entry[]> entries_;
     std::uint32_t size_{0};
     std::uint32_t tombstones_{0};
+    mutable std::uint32_t last_probe_count_{0};
+    mutable std::array<std::uint64_t, kProbeHistogramBucketCount> probe_histogram_{};
 
     static constexpr std::uint64_t splitmix64(std::uint64_t value) noexcept
     {
@@ -196,16 +224,35 @@ private:
         return value + 1U;
     }
 
-    void place(const std::uint32_t index, const OrderId id, Order* order) noexcept
+    [[nodiscard]] std::uint32_t find_index(const OrderId id, std::uint32_t& probes) const noexcept
     {
-        if (entries_[index].state == SlotState::Deleted) {
-            --tombstones_;
+        probes = 0;
+        if (capacity_ == 0 || id == kInvalidOrderId) {
+            return kInvalidIndex;
         }
 
-        entries_[index].id = id;
-        entries_[index].order = order;
-        entries_[index].state = SlotState::Occupied;
-        ++size_;
+        std::uint32_t slot = hash(id);
+        for (std::uint32_t step = 0; step < capacity_; ++step) {
+            ++probes;
+            const Entry& entry = entries_[slot];
+            if (entry.state == SlotState::Empty) {
+                return kInvalidIndex;
+            }
+            if (entry.state == SlotState::Occupied && entry.id == id) {
+                return slot;
+            }
+            slot = (slot + 1U) & mask_;
+        }
+
+        return kInvalidIndex;
+    }
+
+    void record_probe_count(const std::uint32_t probes) const noexcept
+    {
+        last_probe_count_ = probes;
+        const std::size_t bucket =
+            std::min<std::size_t>(static_cast<std::size_t>(probes), kProbeHistogramBucketCount - 1U);
+        ++probe_histogram_[bucket];
     }
 };
 

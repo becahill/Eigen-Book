@@ -30,6 +30,12 @@ public:
         destroy_live_objects();
     }
 
+    void clear() noexcept
+    {
+        destroy_live_objects();
+        reset_free_list();
+    }
+
     template <typename... Args>
     [[nodiscard]] T* allocate(Args&&... args) noexcept
     {
@@ -102,6 +108,7 @@ private:
 
     void reset_free_list() noexcept
     {
+        size_ = 0;
         if (capacity_ == 0) {
             free_head_ = kNoSlot;
             return;
@@ -113,7 +120,6 @@ private:
         }
 
         free_head_ = 0;
-        size_ = 0;
     }
 
     void destroy_live_objects() noexcept

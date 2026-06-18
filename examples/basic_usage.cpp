@@ -62,6 +62,11 @@ int main()
     print_quote(Side::Buy, book.best_bid());
     print_quote(Side::Sell, book.best_ask());
 
+    const ReplaceResult replace = book.replace_order(1, 100, 80);
+    require(replace.status == Status::Accepted, "failed to replace resting bid");
+    require(replace.old_price == 99, "unexpected replaced price");
+    require(replace.resting_quantity == 80, "unexpected replaced quantity");
+
     const MatchResult match = book.match_market_order(Side::Buy, 30);
     require(match.status == Status::Filled, "failed to match market buy");
     require(match.executed_quantity == 30, "unexpected executed quantity");
@@ -70,7 +75,19 @@ int main()
 
     const CancelResult cancel = book.cancel_order(1);
     require(cancel.status == Status::Cancelled, "failed to cancel resting bid");
-    require(cancel.canceled_quantity == 100, "unexpected canceled quantity");
+    require(cancel.canceled_quantity == 80, "unexpected canceled quantity");
+
+    const AddOrderResult fok = book.add_limit_order(3, Side::Buy, 101, 20, 1, TimeInForce::Fok);
+    require(fok.status == Status::Filled, "failed to fill FOK order");
+    require(fok.resting_quantity == 0, "FOK order should not rest");
+
+    const AddOrderResult fresh_ask = book.add_limit_order(4, Side::Sell, 102, 10);
+    require(fresh_ask.status == Status::Accepted, "failed to add fresh ask");
+
+    const AddOrderResult ioc = book.add_limit_order(5, Side::Buy, 102, 15, 2, TimeInForce::Ioc);
+    require(ioc.status == Status::PartiallyFilled, "failed to partially fill IOC order");
+    require(ioc.executed_quantity == 10, "unexpected IOC executed quantity");
+    require(ioc.resting_quantity == 0, "IOC order should not rest");
 
     print_quote(Side::Buy, book.best_bid());
     print_quote(Side::Sell, book.best_ask());

@@ -12,10 +12,16 @@ deterministic behavior after construction.
 - occupancy bitsets for bounded best-price discovery
 - fixed-capacity open-addressed order-id lookup
 - limit order matching with residual resting
+- GTC, IOC, and FOK limit order time-in-force semantics
 - market order matching
+- fixed-capacity event log with order and trade events
+- fixed-capacity `MatchingEngine` routing across configured instruments
+- best-first market depth API with caller-provided buffers
+- deterministic snapshot/restore for books and multi-instrument engines
 - O(1) cancellation after id lookup
 - quantity reduction that preserves time priority
 - quantity increase rejection
+- explicit replace-order policy with lose-priority reinsert semantics
 - resource-exhaustion preflight that avoids partial execution when residual
   storage cannot be guaranteed
 
@@ -57,15 +63,86 @@ It checks hand-authored edge cases and seeded deterministic command streams
 covering:
 
 - FIFO price-time priority
-- cancel, reduce, and market execution semantics
+- cancel, reduce, replace, and market execution semantics
 - duplicate, unknown, invalid-id, invalid-price, invalid-quantity, and
   id-map-full paths
 - pool-exhaustion behavior without accidental partial execution
+- IOC residual cancellation and FOK preflight rejection/acceptance
 - best bid/ask, per-price depth, per-price order counts, order lookup, and live
   order-count invariants after every operation
+- multi-instrument isolation, unknown-instrument rejection, depth ordering, and
+  seeded multi-instrument oracle streams
 
 Failing seeded cases are reproducible because the seeds are fixed in
 `tests/test_eigenbook.cpp`.
+
+## Event API
+
+Every mutating operation returns a result struct with `events_emitted` and
+`events`. `events` is a `std::span<const BookEvent>` over the `OrderBook`'s
+internal fixed-capacity `EventLog`; it is valid until the next mutating call on
+the same book.
+
+`BookEvent` and nested `TradeEvent` both carry `instrument_id`. Direct
+`OrderBook` users get `kInvalidInstrumentId` by default; books owned by
+`MatchingEngine` are constructed with their configured instrument id, so the
+delegated result spans are already tagged.
+
+```cpp
+OrderBook book(BookConfig{90, 110, 16, 64, 1});
+
+const AddOrderResult resting = book.add_limit_order(1, Side::Sell, 100, 5, 10);
+const AddOrderResult fill = book.add_limit_order(2, Side::Buy, 100, 5, 11);
+
+for (const BookEvent& event : fill.events) {
+    if (event.kind == BookEvent::Kind::Trade) {
+        const TradeEvent& trade = event.trade;
+        // trade.aggressor_id == 2, trade.resting_id == 1
+    }
+}
+```
+
+Limit orders emit `OrderAccepted`, one `Trade` per resting-order fill, and then
+either `OrderResting` for a GTC residual or `OrderCancelled` for an IOC
+remainder. FOK orders preflight executable quantity before any book mutation; an
+insufficient FOK emits `OrderRejected` with `Status::FokRejected`. Successful
+cancels and quantity reductions emit `OrderCancelled` and `OrderModified`.
+Replacements that lose priority emit `OrderCancelled`, `OrderAccepted`, any
+`Trade` events, and then `OrderResting` for a GTC residual or `OrderCancelled`
+for an IOC residual. Rejected commands emit `OrderRejected` with the `Status`
+reason. `TimeInForce` supports `Gtc`, `Ioc`, and `Fok`, and existing calls
+default to GTC behavior.
+
+## Multi-Instrument Routing And Depth
+
+`MatchingEngine` owns a fixed number of instrument books and a fixed
+open-addressed lookup table built at construction. Hot-path routing uses
+bounded O(1) lookup by `InstrumentId`; unknown instruments return
+`Status::UnknownInstrument` without mutating any book or emitting events.
+
+```cpp
+#include "MatchingEngine.hpp"
+
+BookConfig book_config{90, 110, 64, 128, 1};
+InstrumentConfig instruments[] = {
+    InstrumentConfig{101, book_config},
+    InstrumentConfig{202, book_config},
+};
+
+MatchingEngine engine(instruments);
+
+static_cast<void>(engine.add_limit_order(101, 1, Side::Buy, 100, 10));
+static_cast<void>(engine.add_limit_order(202, 1, Side::Sell, 105, 20));
+
+DepthLevel levels[8]{};
+const std::uint32_t written = engine.depth(101, Side::Buy, 8, levels);
+const TopOfBook top = engine.top_of_book(101);
+```
+
+Depth is per instrument and side. It writes into caller-owned storage and
+returns the number of levels written. Bid levels are best-first descending by
+price; ask levels are best-first ascending by price. Each `DepthLevel` contains
+`price`, `aggregate_quantity`, and `order_count`.
 
 ## Usage Example
 
@@ -73,15 +150,52 @@ Failing seeded cases are reproducible because the seeds are fixed in
 
 - create an `OrderBook`
 - add resting bid and ask orders
+- replace a resting order
 - execute a market order
 - cancel by order id
 - inspect best bid and best ask
+
+`examples/snapshot_usage.cpp` shows how to serialize a book into caller-owned
+storage, restore into an already constructed empty book, and continue trading.
 
 Build and run it from any configured build directory:
 
 ```sh
 cmake --build build-debug --target eigenbook_basic_usage
 ./build-debug/eigenbook_basic_usage
+cmake --build build-debug --target eigenbook_snapshot_usage
+./build-debug/eigenbook_snapshot_usage
+```
+
+IOC and FOK are selected with the optional final `TimeInForce` parameter:
+
+```cpp
+OrderBook book(BookConfig{90, 110, 16, 64, 1});
+
+static_cast<void>(book.add_limit_order(1, Side::Sell, 100, 5));
+
+const AddOrderResult ioc = book.add_limit_order(2, Side::Buy, 100, 8, 10, TimeInForce::Ioc);
+// ioc.status == Status::PartiallyFilled, ioc.executed_quantity == 5.
+// The unfilled quantity is reported with an OrderCancelled event and never rests.
+
+static_cast<void>(book.add_limit_order(3, Side::Sell, 101, 3));
+
+const AddOrderResult fok = book.add_limit_order(4, Side::Buy, 101, 3, 11, TimeInForce::Fok);
+// fok.status == Status::Filled only because the full quantity was executable.
+```
+
+`replace_order(id, new_price, new_quantity, tif)` keeps FIFO priority only for
+same-price reductions. Same-price increases and price changes cancel the old
+order and submit the replacement at the tail of the new price level:
+
+```cpp
+OrderBook book(BookConfig{90, 110, 16, 64, 1});
+
+static_cast<void>(book.add_limit_order(1, Side::Buy, 99, 10));
+static_cast<void>(book.add_limit_order(2, Side::Buy, 100, 10));
+
+const ReplaceResult replaced = book.replace_order(2, 99, 10);
+// Order 2 moved behind order 1 at price 99.
 ```
 
 ## Benchmarks
@@ -94,9 +208,10 @@ cmake --build build-release --target eigenbook_bench
 ```
 
 The benchmark target is dependency-free and measures add, cancel, modify,
-market-match, and mixed workloads. See `docs/performance.md` for methodology,
-local recorded results, and limitations. Do not update benchmark numbers without
-rerunning locally and recording hardware/compiler context.
+replace, market-match, IOC/FOK limit-order paths, and mixed workloads. See
+`docs/performance.md` for methodology, local recorded results, and limitations.
+Do not update benchmark numbers without rerunning locally and recording
+hardware/compiler context.
 
 Set `-DEIGENBOOK_BUILD_BENCHMARKS=OFF` to skip building benchmarks.
 

@@ -1,10 +1,14 @@
 #include "OrderBook.hpp"
+#include "Snapshot.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace {
@@ -28,6 +32,12 @@ struct BenchmarkResult final {
 [[nodiscard]] BookConfig make_config(const std::uint32_t max_orders) noexcept
 {
     return BookConfig{1, 1'000, max_orders, max_orders * 4U};
+}
+
+[[nodiscard]] BookConfig make_wide_config(const std::uint32_t max_orders,
+                                          const PriceLevelMode mode) noexcept
+{
+    return BookConfig{1, 1'000'000, max_orders, max_orders * 4U, 1, 0, mode};
 }
 
 template <typename Fn>
@@ -94,6 +104,76 @@ template <typename Fn>
     });
 }
 
+[[nodiscard]] BenchmarkResult benchmark_dense_wide_sparse_prices(const std::uint32_t operations)
+{
+    OrderBook book(make_wide_config(operations + 16U, PriceLevelMode::Dense));
+    constexpr std::array<Price, 20> prices{
+        10,
+        50'000,
+        100'000,
+        150'000,
+        200'000,
+        250'000,
+        300'000,
+        350'000,
+        400'000,
+        450'000,
+        500'000,
+        550'000,
+        600'000,
+        650'000,
+        700'000,
+        750'000,
+        800'000,
+        850'000,
+        900'000,
+        950'000,
+    };
+
+    return run_benchmark("Dense wide 20 prices", operations, [&](const std::uint32_t i) {
+        const AddOrderResult result =
+            book.add_limit_order(static_cast<OrderId>(40'000'000ULL + i), Side::Buy, prices[i % prices.size()], 100);
+        if (result.status != Status::Accepted) {
+            std::abort();
+        }
+    });
+}
+
+[[nodiscard]] BenchmarkResult benchmark_sparse_wide_sparse_prices(const std::uint32_t operations)
+{
+    OrderBook book(make_wide_config(operations + 16U, PriceLevelMode::Sparse));
+    constexpr std::array<Price, 20> prices{
+        10,
+        50'000,
+        100'000,
+        150'000,
+        200'000,
+        250'000,
+        300'000,
+        350'000,
+        400'000,
+        450'000,
+        500'000,
+        550'000,
+        600'000,
+        650'000,
+        700'000,
+        750'000,
+        800'000,
+        850'000,
+        900'000,
+        950'000,
+    };
+
+    return run_benchmark("Sparse wide 20 prices", operations, [&](const std::uint32_t i) {
+        const AddOrderResult result =
+            book.add_limit_order(static_cast<OrderId>(50'000'000ULL + i), Side::Buy, prices[i % prices.size()], 100);
+        if (result.status != Status::Accepted) {
+            std::abort();
+        }
+    });
+}
+
 [[nodiscard]] BenchmarkResult benchmark_cancel_orders(const std::uint32_t operations)
 {
     OrderBook book(make_config(operations + 16U));
@@ -136,6 +216,27 @@ template <typename Fn>
     });
 }
 
+[[nodiscard]] BenchmarkResult benchmark_replace_orders(const std::uint32_t operations)
+{
+    OrderBook book(make_config(operations + 16U));
+    std::vector<OrderId> ids(operations);
+
+    for (std::uint32_t i = 0; i < operations; ++i) {
+        ids[i] = static_cast<OrderId>(i + 1U);
+        const AddOrderResult result = book.add_limit_order(ids[i], Side::Buy, 100, 100);
+        if (result.status != Status::Accepted) {
+            std::abort();
+        }
+    }
+
+    return run_benchmark("Replace N orders", operations, [&](const std::uint32_t i) {
+        const ReplaceResult result = book.replace_order(ids[i], 101, 100);
+        if (result.status != Status::Accepted) {
+            std::abort();
+        }
+    });
+}
+
 [[nodiscard]] BenchmarkResult benchmark_market_matches(const std::uint32_t operations)
 {
     OrderBook book(make_config(operations + 16U));
@@ -150,6 +251,59 @@ template <typename Fn>
     return run_benchmark("Match market orders", operations, [&](const std::uint32_t) {
         const MatchResult result = book.match_market_order(Side::Buy, 1);
         if (result.status != Status::Filled) {
+            std::abort();
+        }
+    });
+}
+
+[[nodiscard]] BenchmarkResult benchmark_ioc_partial_matches(const std::uint32_t operations)
+{
+    OrderBook book(make_config(operations + 16U));
+
+    for (std::uint32_t i = 0; i < operations; ++i) {
+        const AddOrderResult result = book.add_limit_order(static_cast<OrderId>(i + 1U), Side::Sell, 100, 1);
+        if (result.status != Status::Accepted) {
+            std::abort();
+        }
+    }
+
+    return run_benchmark("IOC partial matches", operations, [&](const std::uint32_t i) {
+        const AddOrderResult result =
+            book.add_limit_order(10'000'000ULL + i, Side::Buy, 100, 2, 0, TimeInForce::Ioc);
+        if (result.status != Status::PartiallyFilled || result.resting_quantity != 0) {
+            std::abort();
+        }
+    });
+}
+
+[[nodiscard]] BenchmarkResult benchmark_fok_rejects(const std::uint32_t operations)
+{
+    OrderBook book(make_config(16U));
+
+    return run_benchmark("FOK rejects", operations, [&](const std::uint32_t i) {
+        const AddOrderResult result =
+            book.add_limit_order(20'000'000ULL + i, Side::Buy, 100, 1, 0, TimeInForce::Fok);
+        if (result.status != Status::FokRejected) {
+            std::abort();
+        }
+    });
+}
+
+[[nodiscard]] BenchmarkResult benchmark_fok_accepts(const std::uint32_t operations)
+{
+    OrderBook book(make_config(operations + 16U));
+
+    for (std::uint32_t i = 0; i < operations; ++i) {
+        const AddOrderResult result = book.add_limit_order(static_cast<OrderId>(i + 1U), Side::Sell, 100, 1);
+        if (result.status != Status::Accepted) {
+            std::abort();
+        }
+    }
+
+    return run_benchmark("FOK full matches", operations, [&](const std::uint32_t i) {
+        const AddOrderResult result =
+            book.add_limit_order(30'000'000ULL + i, Side::Buy, 100, 1, 0, TimeInForce::Fok);
+        if (result.status != Status::Filled || result.resting_quantity != 0) {
             std::abort();
         }
     });
@@ -262,6 +416,61 @@ struct Event final {
     });
 }
 
+[[nodiscard]] BenchmarkResult benchmark_snapshot_serialize(const std::uint32_t operations)
+{
+    constexpr std::uint32_t live_orders = 256;
+    OrderBook book(make_config(live_orders + 16U));
+    std::vector<std::byte> buffer(64U * 1024U);
+
+    for (std::uint32_t i = 0; i < live_orders; ++i) {
+        const Side side = i % 2U == 0U ? Side::Buy : Side::Sell;
+        const Price price = side == Side::Buy ? 100 + static_cast<Price>(i % 20U)
+                                              : 200 + static_cast<Price>(i % 20U);
+        const AddOrderResult result = book.add_limit_order(static_cast<OrderId>(i + 1U), side, price, 100);
+        if (result.status != Status::Accepted) {
+            std::abort();
+        }
+    }
+
+    return run_benchmark("Serialize book snapshot", operations, [&](const std::uint32_t) {
+        const SnapshotWriteResult result = serialize(book, buffer);
+        if (result.status != Status::Accepted) {
+            std::abort();
+        }
+    });
+}
+
+[[nodiscard]] BenchmarkResult benchmark_snapshot_restore(const std::uint32_t operations)
+{
+    constexpr std::uint32_t live_orders = 256;
+    const BookConfig config = make_config(live_orders + 16U);
+    OrderBook source(config);
+    OrderBook target(config);
+    std::vector<std::byte> buffer(64U * 1024U);
+
+    for (std::uint32_t i = 0; i < live_orders; ++i) {
+        const Side side = i % 2U == 0U ? Side::Buy : Side::Sell;
+        const Price price = side == Side::Buy ? 100 + static_cast<Price>(i % 20U)
+                                              : 200 + static_cast<Price>(i % 20U);
+        const AddOrderResult result = source.add_limit_order(static_cast<OrderId>(i + 1U), side, price, 100);
+        if (result.status != Status::Accepted) {
+            std::abort();
+        }
+    }
+
+    const SnapshotWriteResult snapshot = serialize(source, buffer);
+    if (snapshot.status != Status::Accepted) {
+        std::abort();
+    }
+
+    return run_benchmark("Restore book snapshot", operations, [&](const std::uint32_t) {
+        const Status status = restore(target, std::span<const std::byte>(buffer.data(), snapshot.bytes_written));
+        if (status != Status::Accepted) {
+            std::abort();
+        }
+    });
+}
+
 void print_result(const BenchmarkResult& result)
 {
     std::printf("| %-29s | %10llu | %10.3f | %14.0f | %8.1f | %6llu | %6llu | %6llu |\n",
@@ -282,18 +491,34 @@ int main()
     constexpr std::uint32_t operations = 50'000;
 
     const BenchmarkResult add = benchmark_add_orders(operations);
+    const BenchmarkResult dense_wide = benchmark_dense_wide_sparse_prices(operations);
+    const BenchmarkResult sparse_wide = benchmark_sparse_wide_sparse_prices(operations);
     const BenchmarkResult cancel = benchmark_cancel_orders(operations);
     const BenchmarkResult modify = benchmark_modify_orders(operations);
+    const BenchmarkResult replace = benchmark_replace_orders(operations);
     const BenchmarkResult match = benchmark_market_matches(operations);
+    const BenchmarkResult ioc = benchmark_ioc_partial_matches(operations);
+    const BenchmarkResult fok_reject = benchmark_fok_rejects(operations);
+    const BenchmarkResult fok_accept = benchmark_fok_accepts(operations);
     const BenchmarkResult mixed = benchmark_mixed_workload(operations);
+    const BenchmarkResult snapshot_serialize = benchmark_snapshot_serialize(operations);
+    const BenchmarkResult snapshot_restore = benchmark_snapshot_restore(operations);
 
     std::printf("Eigen-Book microbenchmarks (%u operations per scenario)\n", operations);
     std::printf("| Scenario                      | Operations | Total ms   | Ops/sec        | Avg ns   | p50 ns | p95 ns | p99 ns |\n");
     std::printf("|-------------------------------|------------|------------|----------------|----------|--------|--------|--------|\n");
     print_result(add);
+    print_result(dense_wide);
+    print_result(sparse_wide);
     print_result(cancel);
     print_result(modify);
+    print_result(replace);
     print_result(match);
+    print_result(ioc);
+    print_result(fok_reject);
+    print_result(fok_accept);
     print_result(mixed);
+    print_result(snapshot_serialize);
+    print_result(snapshot_restore);
     return 0;
 }

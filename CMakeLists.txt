@@ -77,4 +77,8 @@ if(EIGENBOOK_BUILD_EXAMPLES)
     add_executable(eigenbook_basic_usage
         examples/basic_usage.cpp)
     target_link_libraries(eigenbook_basic_usage PRIVATE EigenBook::eigenbook)
+
+    add_executable(eigenbook_snapshot_usage
+        examples/snapshot_usage.cpp)
+    target_link_libraries(eigenbook_snapshot_usage PRIVATE EigenBook::eigenbook)
 endif()

@@ -47,12 +47,21 @@ Because timing still has measurement overhead and is not CPU-pinned, the absolut
 | Add N orders | Add non-crossing buy limit orders |
 | Cancel N orders | Preload orders, then cancel by id |
 | Modify N orders | Preload orders, then reduce quantity |
+| Replace N orders | Preload orders, then replace at a new non-crossing price |
 | Match market orders | Preload sell liquidity, then execute buy market orders |
+| IOC partial matches | Preload sell liquidity, then submit IOC buys with cancelled residual |
+| FOK rejects | Submit FOK buys with no executable liquidity |
+| FOK full matches | Preload sell liquidity, then submit fully executable FOK buys |
 | Mixed workload | 50% adds, 25% cancels, 15% modifies, 10% executions |
+| Serialize book snapshot | Serialize a 256-order book into caller-provided storage |
+| Restore book snapshot | Restore a 256-order book into an already constructed target |
 
 ## Results
 
-Release run from this workspace on the hardware and compiler above:
+Release run from this workspace on the hardware and compiler above. This table
+predates the replace, IOC/FOK, and snapshot workload rows, so it should not be
+used for those latency claims until `eigenbook_bench` is rerun and the
+hardware/compiler context is recorded with the new output.
 
 ```text
 Eigen-Book microbenchmarks (50000 operations per scenario)
@@ -81,7 +90,7 @@ Eigen-Book microbenchmarks (50000 operations per scenario)
 - binary protocol ingestion
 - market data replay benchmarks
 - lock-free SPSC queue integration boundary
-- snapshotting and restore benchmarks
+- larger multi-instrument snapshot benchmarks
 - add larger configurable batch timing mode
 - add occupancy-word crossing counters
 - add Linux perf counter support
