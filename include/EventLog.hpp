@@ -9,8 +9,11 @@
 
 namespace eigenbook {
 
-// Fixed-capacity event ring. The last operation span is contiguous and remains
-// valid until the next begin_operation() call.
+/// Fixed-capacity event ring for book operation results.
+///
+/// `begin_operation(max_event_count)` reserves a contiguous window for the next
+/// operation. `last_events()` points into `EventLog` storage and remains valid
+/// until the next `begin_operation()` or `reset()` call.
 class alignas(64) EventLog final {
 public:
     explicit EventLog(const std::uint32_t capacity,
@@ -26,18 +29,26 @@ public:
     EventLog(EventLog&&) = delete;
     EventLog& operator=(EventLog&&) = delete;
 
+    /// Clear the last operation span and restart event numbering from
+    /// `next_sequence`.
     void reset(const SequenceNumber next_sequence = 0) noexcept
     {
         write_index_ = 0;
         last_begin_ = 0;
         last_count_ = 0;
         next_sequence_ = next_sequence;
+        last_overflowed_ = false;
     }
 
+    /// Start a new operation with a contiguous span capacity.
+    ///
+    /// Callers should use `can_record()` before mutating book state when an
+    /// operation requires all-or-nothing event emission.
     void begin_operation(std::uint32_t max_event_count) noexcept
     {
         last_begin_ = write_index_;
         last_count_ = 0;
+        last_overflowed_ = false;
 
         if (capacity_ == 0) {
             return;
@@ -53,6 +64,12 @@ public:
         }
 
         last_begin_ = write_index_;
+    }
+
+    /// Return whether a single operation can emit `event_count` events.
+    [[nodiscard]] bool can_record(const std::uint32_t event_count) const noexcept
+    {
+        return event_count <= capacity_;
     }
 
     void append_order(const BookEvent::Kind kind,
@@ -115,6 +132,7 @@ public:
         append(event);
     }
 
+    /// Events emitted by the most recently begun operation.
     [[nodiscard]] std::span<const BookEvent> last_events() const noexcept
     {
         if (events_ == nullptr || last_count_ == 0) {
@@ -134,6 +152,11 @@ public:
         return capacity_;
     }
 
+    [[nodiscard]] bool last_overflowed() const noexcept
+    {
+        return last_overflowed_;
+    }
+
     [[nodiscard]] SequenceNumber next_sequence_value() const noexcept
     {
         return next_sequence_;
@@ -147,6 +170,7 @@ private:
     std::uint32_t last_count_{0};
     SequenceNumber next_sequence_{0};
     InstrumentId instrument_id_{kInvalidInstrumentId};
+    bool last_overflowed_{false};
 
     [[nodiscard]] SequenceNumber next_event_sequence() noexcept
     {
@@ -164,6 +188,7 @@ private:
     void append(const BookEvent& event) noexcept
     {
         if (events_ == nullptr || last_count_ == capacity_) {
+            last_overflowed_ = true;
             return;
         }
 

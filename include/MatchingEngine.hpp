@@ -1,8 +1,10 @@
 #pragma once
 
+#include "Command.hpp"
 #include "OrderBook.hpp"
 #include "Types.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -69,7 +71,9 @@ public:
             return unknown_result<AddOrderResult>();
         }
 
-        return book->add_limit_order(id, side, price, quantity, timestamp, time_in_force);
+        AddOrderResult result = book->add_limit_order(id, side, price, quantity, timestamp, time_in_force);
+        record_event_high_water(result.events_emitted);
+        return result;
     }
 
     [[nodiscard]] CancelResult cancel(const InstrumentId instrument_id,
@@ -81,7 +85,9 @@ public:
             return unknown_result<CancelResult>();
         }
 
-        return book->cancel_order(id, timestamp);
+        CancelResult result = book->cancel_order(id, timestamp);
+        record_event_high_water(result.events_emitted);
+        return result;
     }
 
     [[nodiscard]] CancelResult cancel_order(const InstrumentId instrument_id,
@@ -101,7 +107,9 @@ public:
             return unknown_result<ModifyResult>();
         }
 
-        return book->modify_order(id, new_quantity, timestamp);
+        ModifyResult result = book->modify_order(id, new_quantity, timestamp);
+        record_event_high_water(result.events_emitted);
+        return result;
     }
 
     [[nodiscard]] ModifyResult modify_order(const InstrumentId instrument_id,
@@ -133,9 +141,15 @@ public:
             return unknown_result<ReplaceResult>();
         }
 
-        return book->replace_order(id, new_price, new_quantity, timestamp, time_in_force);
+        ReplaceResult result = book->replace_order(id, new_price, new_quantity, timestamp, time_in_force);
+        record_event_high_water(result.events_emitted);
+        return result;
     }
 
+    /// Route a replace request to one instrument.
+    ///
+    /// Unknown instruments return `Status::UnknownInstrument` with an empty
+    /// event span and do not mutate any book.
     [[nodiscard]] ReplaceResult replace_order(const InstrumentId instrument_id,
                                               const OrderId id,
                                               const Price new_price,
@@ -145,6 +159,7 @@ public:
         return replace(instrument_id, id, new_price, new_quantity, time_in_force);
     }
 
+    /// Route a timestamped replace request to one instrument.
     [[nodiscard]] ReplaceResult replace_order(const InstrumentId instrument_id,
                                               const OrderId id,
                                               const Price new_price,
@@ -166,7 +181,75 @@ public:
             return unknown_result<MatchResult>();
         }
 
-        return book->match_market_order(aggressor_side, quantity, aggressor_id, timestamp);
+        MatchResult result = book->match_market_order(aggressor_side, quantity, aggressor_id, timestamp);
+        record_event_high_water(result.events_emitted);
+        return result;
+    }
+
+    /// Decode and dispatch one fixed-size command record.
+    ///
+    /// Decode failures increment dispatch/decode statistics, return an empty
+    /// event span, and do not mutate any book. Extra bytes after
+    /// `kCommandWireSize` are ignored by `decode`.
+    [[nodiscard]] DispatchResult dispatch(std::span<const std::byte> buffer) noexcept
+    {
+        Command command{};
+        const Status status = decode(buffer, command);
+        if (status != Status::Accepted) {
+            ++dispatch_count_;
+            ++decode_errors_;
+            return finish_dispatch(make_dispatch_result(status));
+        }
+
+        return dispatch(command);
+    }
+
+    /// Dispatch one validated command object to its target instrument.
+    ///
+    /// Invalid command enums and unknown instruments return explicit statuses
+    /// with empty event spans. Unknown instruments do not mutate any book.
+    [[nodiscard]] DispatchResult dispatch(const Command& command) noexcept
+    {
+        ++dispatch_count_;
+        if (!valid_command_op(command.op)) {
+            return finish_dispatch(make_dispatch_result(Status::InvalidCommand));
+        }
+
+        count_dispatch_op(command.op);
+        if (!valid_command(command)) {
+            return finish_dispatch(make_dispatch_result(Status::InvalidCommand));
+        }
+
+        switch (command.op) {
+        case CommandOp::Add:
+            return finish_dispatch(to_dispatch_result(add_limit_order(command.instrument_id,
+                                                                      command.order_id,
+                                                                      command.side,
+                                                                      command.price,
+                                                                      command.quantity,
+                                                                      command.timestamp,
+                                                                      command.time_in_force)));
+        case CommandOp::Cancel:
+            return finish_dispatch(to_dispatch_result(cancel(command.instrument_id, command.order_id, command.timestamp)));
+        case CommandOp::Modify:
+            return finish_dispatch(
+                to_dispatch_result(modify(command.instrument_id, command.order_id, command.quantity, command.timestamp)));
+        case CommandOp::Replace:
+            return finish_dispatch(to_dispatch_result(replace(command.instrument_id,
+                                                              command.order_id,
+                                                              command.price,
+                                                              command.quantity,
+                                                              command.timestamp,
+                                                              command.time_in_force)));
+        case CommandOp::Market:
+            return finish_dispatch(to_dispatch_result(match_market_order(command.instrument_id,
+                                                                         command.side,
+                                                                         command.quantity,
+                                                                         command.order_id,
+                                                                         command.timestamp)));
+        }
+
+        return finish_dispatch(make_dispatch_result(Status::InvalidCommand));
     }
 
     [[nodiscard]] std::uint32_t depth(const InstrumentId instrument_id,
@@ -292,6 +375,16 @@ public:
         result.order_pool_utilization = utilization(result.total_live_order_count, result.total_order_capacity);
         result.order_id_map_utilization =
             utilization(result.aggregate_order_id_map.size, result.aggregate_order_id_map.capacity);
+        result.dispatch_count = dispatch_count_;
+        result.adds = adds_;
+        result.cancels = cancels_;
+        result.modifies = modifies_;
+        result.replaces = replaces_;
+        result.market_matches = market_matches_;
+        result.rejects = rejects_;
+        result.rejects_by_status = rejects_by_status_;
+        result.event_log_high_water_mark = event_log_high_water_mark_;
+        result.decode_errors = decode_errors_;
         return result;
     }
 
@@ -313,6 +406,170 @@ private:
     std::uint32_t lookup_capacity_{0};
     std::unique_ptr<LookupSlot[]> lookup_;
     bool valid_{true};
+    std::uint64_t dispatch_count_{0};
+    std::uint64_t adds_{0};
+    std::uint64_t cancels_{0};
+    std::uint64_t modifies_{0};
+    std::uint64_t replaces_{0};
+    std::uint64_t market_matches_{0};
+    std::uint64_t rejects_{0};
+    std::array<std::uint64_t, kStatusCount> rejects_by_status_{};
+    std::uint32_t event_log_high_water_mark_{0};
+    std::uint64_t decode_errors_{0};
+
+    [[nodiscard]] static DispatchResult make_dispatch_result(const Status status) noexcept
+    {
+        DispatchResult result{};
+        result.status = status;
+        return result;
+    }
+
+    [[nodiscard]] static DispatchResult to_dispatch_result(const AddOrderResult& source) noexcept
+    {
+        DispatchResult result{};
+        result.status = source.status;
+        result.accepted_quantity = source.accepted_quantity;
+        result.executed_quantity = source.executed_quantity;
+        result.resting_quantity = source.resting_quantity;
+        result.fills = source.fills;
+        result.has_last_price = source.has_last_price;
+        result.last_price = source.last_price;
+        result.events_emitted = source.events_emitted;
+        result.events = source.events;
+        return result;
+    }
+
+    [[nodiscard]] static DispatchResult to_dispatch_result(const CancelResult& source) noexcept
+    {
+        DispatchResult result{};
+        result.status = source.status;
+        result.canceled_quantity = source.canceled_quantity;
+        result.events_emitted = source.events_emitted;
+        result.events = source.events;
+        return result;
+    }
+
+    [[nodiscard]] static DispatchResult to_dispatch_result(const ModifyResult& source) noexcept
+    {
+        DispatchResult result{};
+        result.status = source.status;
+        result.old_quantity = source.old_quantity;
+        result.new_quantity = source.new_quantity;
+        result.events_emitted = source.events_emitted;
+        result.events = source.events;
+        return result;
+    }
+
+    [[nodiscard]] static DispatchResult to_dispatch_result(const ReplaceResult& source) noexcept
+    {
+        DispatchResult result{};
+        result.status = source.status;
+        result.old_price = source.old_price;
+        result.new_price = source.new_price;
+        result.old_quantity = source.old_quantity;
+        result.new_quantity = source.new_quantity;
+        result.executed_quantity = source.executed_quantity;
+        result.resting_quantity = source.resting_quantity;
+        result.fills = source.fills;
+        result.has_last_price = source.has_last_price;
+        result.last_price = source.last_price;
+        result.events_emitted = source.events_emitted;
+        result.events = source.events;
+        return result;
+    }
+
+    [[nodiscard]] static DispatchResult to_dispatch_result(const MatchResult& source) noexcept
+    {
+        DispatchResult result{};
+        result.status = source.status;
+        result.requested_quantity = source.requested_quantity;
+        result.executed_quantity = source.executed_quantity;
+        result.remaining_quantity = source.remaining_quantity;
+        result.fills = source.fills;
+        result.has_last_price = source.has_last_price;
+        result.last_price = source.last_price;
+        result.events_emitted = source.events_emitted;
+        result.events = source.events;
+        return result;
+    }
+
+    [[nodiscard]] DispatchResult finish_dispatch(DispatchResult result) noexcept
+    {
+        record_event_high_water(result.events_emitted);
+
+        if (reject_status(result.status)) {
+            ++rejects_;
+            const std::size_t index = static_cast<std::size_t>(result.status);
+            if (index < rejects_by_status_.size()) {
+                ++rejects_by_status_[index];
+            }
+        }
+
+        return result;
+    }
+
+    void record_event_high_water(const std::uint32_t events_emitted) noexcept
+    {
+        if (events_emitted > event_log_high_water_mark_) {
+            event_log_high_water_mark_ = events_emitted;
+        }
+    }
+
+    void count_dispatch_op(const CommandOp op) noexcept
+    {
+        switch (op) {
+        case CommandOp::Add:
+            ++adds_;
+            break;
+        case CommandOp::Cancel:
+            ++cancels_;
+            break;
+        case CommandOp::Modify:
+            ++modifies_;
+            break;
+        case CommandOp::Replace:
+            ++replaces_;
+            break;
+        case CommandOp::Market:
+            ++market_matches_;
+            break;
+        }
+    }
+
+    [[nodiscard]] static bool reject_status(const Status status) noexcept
+    {
+        switch (status) {
+        case Status::Accepted:
+        case Status::Cancelled:
+        case Status::Filled:
+        case Status::PartiallyFilled:
+        case Status::NoLiquidity:
+            return false;
+        case Status::Rejected:
+        case Status::InvalidOrderId:
+        case Status::UnknownOrderId:
+        case Status::UnknownInstrument:
+        case Status::InvalidQuantity:
+        case Status::InvalidPrice:
+        case Status::DuplicateOrderId:
+        case Status::PoolExhausted:
+        case Status::OrderIdMapFull:
+        case Status::QuantityIncreaseRejected:
+        case Status::InvalidConfiguration:
+        case Status::InternalError:
+        case Status::FokRejected:
+        case Status::BufferTooSmall:
+        case Status::SnapshotFormatMismatch:
+        case Status::SnapshotVersionMismatch:
+        case Status::SnapshotConfigurationMismatch:
+        case Status::SnapshotCapacityExceeded:
+        case Status::InvalidCommand:
+        case Status::EventLogFull:
+            return true;
+        }
+
+        return true;
+    }
 
     [[nodiscard]] OrderBook* find_book(const InstrumentId instrument_id) noexcept
     {

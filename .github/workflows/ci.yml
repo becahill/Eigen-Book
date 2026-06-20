@@ -44,3 +44,37 @@ jobs:
 
       - name: Run tests
         run: ctest --test-dir "${{ matrix.build-dir }}" --output-on-failure
+
+  fuzz-smoke:
+    name: Clang fuzz smoke
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install matched Clang and libFuzzer runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang-18 libclang-rt-18-dev
+
+      - name: Configure fuzzers
+        env:
+          CC: clang-18
+          CXX: clang++-18
+        run: >
+          cmake -S . -B build-ci-fuzz
+          -DCMAKE_BUILD_TYPE=Debug
+          -DEIGENBOOK_BUILD_FUZZERS=ON
+          -DEIGENBOOK_BUILD_BENCHMARKS=OFF
+          -DEIGENBOOK_BUILD_EXAMPLES=OFF
+
+      - name: Build fuzzers
+        run: >
+          cmake --build build-ci-fuzz --parallel
+          --target eigenbook_command_fuzzer eigenbook_snapshot_fuzzer
+
+      - name: Run bounded fuzz smoke tests
+        run: >
+          ctest --test-dir build-ci-fuzz --output-on-failure
+          --tests-regex '^eigenbook_fuzz_.*_smoke$'

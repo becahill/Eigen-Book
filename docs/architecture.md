@@ -187,11 +187,12 @@ resting liquidity. This preflight is deterministic and bounded by eligible
 occupied levels plus dense occupancy words crossed; in sparse mode traversal is
 bounded by eligible occupied levels.
 
-Lose-priority `replace_order` paths use the same residual-storage preflight
-before cancelling the old order. The check is intentionally conservative: a GTC
-replacement that would need to rest requires spare pool and id-map capacity
-before the old order's storage is released. If that capacity is not available,
-the replacement emits `OrderRejected` and the original order remains unchanged.
+Lose-priority `replace_order` paths preflight residual storage before cancelling
+the old order. Because replacement reuses the existing `Order` slot and
+`OrderIdMap` entry, a full order pool or full id map does not by itself reject a
+GTC replacement that can rest its residual in that reused storage. If the
+destination price level cannot store the residual, the replacement emits
+`OrderRejected` and the original order remains unchanged.
 
 ## Time In Force
 
@@ -262,6 +263,55 @@ nested `TradeEvent` is tagged without rewriting result spans in the router. The
 span lifetime is still per underlying book: it remains valid until the next
 mutating operation on that same instrument book.
 
+## Command Wire Format And Dispatch
+
+`include/Command.hpp` defines a fixed-size binary command record for replay and
+gateway-style ingestion. The struct is packed for auditability, while
+`encode`/`decode` write and read an explicit little-endian byte stream. The wire
+size is `kCommandWireSize == 39` bytes.
+
+| Offset | Size | Field | Type |
+|---:|---:|---|---|
+| 0 | 4 | `instrument_id` | `u32` |
+| 4 | 1 | `op` | `CommandOp` (`Add`, `Cancel`, `Modify`, `Replace`, `Market`) |
+| 5 | 8 | `order_id` | `u64` |
+| 13 | 1 | `side` | `Side` |
+| 14 | 8 | `price` | `i64` bits |
+| 22 | 8 | `quantity` | `u64` |
+| 30 | 1 | `time_in_force` | `TimeInForce` |
+| 31 | 8 | `timestamp` | `u64` |
+
+`decode` validates the enum fields and returns `Status::InvalidCommand` for
+unknown op, side, or time-in-force values. Truncated buffers return
+`Status::BufferTooSmall`; no partially decoded command is dispatched.
+
+Dispatch flow:
+
+```text
+encoded bytes
+  |
+  +-- decode fixed 39-byte command
+  |     +-- BufferTooSmall / InvalidCommand -> reject, no book mutation
+  |
+  +-- MatchingEngine::dispatch(command)
+        +-- validate command enum fields
+        +-- count dispatch/op attempt
+        +-- fixed instrument lookup
+        +-- route by CommandOp:
+              Add     -> add_limit_order
+              Cancel  -> cancel
+              Modify  -> modify
+              Replace -> replace
+              Market  -> match_market_order
+        +-- copy operation result into DispatchResult
+        +-- update reject counters and event high-water mark
+```
+
+`DispatchResult` is a common wrapper over the existing operation result fields.
+Its event span has the same lifetime as direct API results: it is owned by the
+target instrument's `OrderBook` and remains valid until the next mutating call on
+that same book.
+
 ## Snapshot And Restore
 
 `Snapshot.hpp` provides warm-path recovery helpers:
@@ -277,6 +327,11 @@ The caller owns the fixed byte buffer. Serialization returns
 snapshot. Restore validates the complete buffer before rebuilding fixed storage
 and rejects corrupt, truncated, version-mismatched, or configuration-mismatched
 data with explicit `Status` values.
+
+Validation also rejects crossed resting books, duplicate non-saturated arrival
+sequences, and FIFO records whose arrival sequences move backward at one price.
+These checks run before the destination is cleared, so malformed snapshots
+return an explicit status without changing the preconfigured book.
 
 Snapshots are not matching hot-path operations. They are intended for recovery,
 replay checkpoints, and deterministic test or simulator handoff. The
@@ -377,8 +432,9 @@ bid and ask quotes.
 ## Event Model
 
 `OrderBook` owns an `EventLog`, a construction-time allocated ring buffer of
-`BookEvent` entries. The normalized configuration keeps event capacity at least
-`max_orders + 2`, which is enough for the largest single operation:
+`BookEvent` entries. `BookConfig::event_log_capacity == 0` selects the default
+operation-safe capacity of at least `max_orders + 2`, which is enough for the
+largest single operation:
 
 - one `OrderAccepted` event
 - one `Trade` event per live resting order that can be filled
@@ -386,6 +442,14 @@ bid and ask quotes.
   IOC
 - for replace, one old-order `OrderCancelled` event plus at most `max_orders - 1`
   trade events, because the replaced order is removed before matching
+
+A nonzero `event_log_capacity` is treated as an explicit cap. Eigen-Book uses
+policy A for overflow: if a mutating operation would emit more events than the
+configured cap can hold, it returns `Status::EventLogFull`, emits no events, and
+does not mutate the book. The preflight happens after validation but before the
+first state change. The work is bounded by the same eligible resting orders that
+matching may touch because the preflight counts the exact fills that would emit
+trade events.
 
 Every mutating API call starts a new event operation. The returned result struct
 contains:
@@ -486,8 +550,9 @@ time priority:
   and submits the replacement at the FIFO tail of the new price level.
 - IOC and FOK are applied to lose-priority replacements as they are to new limit
   orders at the replacement price and quantity.
-- Pool or id-map exhaustion on a GTC replacement that would need to rest rejects
-  before the old order is cancelled, leaving the book unchanged.
+- GTC replacements reuse the existing order slot and id-map entry for any
+  residual. Residual-storage failures still reject before the old order is
+  cancelled, leaving the book unchanged.
 
 Rejecting quantity increases through `modify_order` avoids silently granting
 extra quantity at an old timestamp. Callers that want increase-or-price-change

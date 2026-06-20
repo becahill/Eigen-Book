@@ -1,3 +1,4 @@
+#include "Command.hpp"
 #include "MatchingEngine.hpp"
 #include "OrderBook.hpp"
 #include "Snapshot.hpp"
@@ -34,6 +35,20 @@ using namespace eigenbook;
 [[nodiscard]] constexpr unsigned status_value(const Status status) noexcept
 {
     return static_cast<unsigned>(status);
+}
+
+[[nodiscard]] constexpr std::byte byte_value(const unsigned value) noexcept
+{
+    return static_cast<std::byte>(value);
+}
+
+void write_u64_le(std::span<std::byte> buffer, const std::size_t offset, const std::uint64_t value)
+{
+    CHECK(offset <= buffer.size());
+    CHECK(sizeof(value) <= buffer.size() - offset);
+    for (std::size_t index = 0; index < sizeof(value); ++index) {
+        buffer[offset + index] = byte_value(static_cast<unsigned>((value >> (index * 8U)) & 0xffU));
+    }
 }
 
 void check_status(const Status actual, const Status expected, const char* context)
@@ -271,40 +286,63 @@ public:
     {
         AddOrderResult result{};
         result.accepted_quantity = quantity;
-        event_log_.begin_operation(max_events_for_add());
+        event_log_.begin_operation(0);
 
         const Status validation_status = validate_new_order(id, price, quantity);
         if (validation_status != Status::Accepted) {
             result.status = validation_status;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             emit_order_rejected(id, side, price, quantity, timestamp, time_in_force, validation_status);
             return finish_result(result);
         }
 
         if (!valid_time_in_force(time_in_force)) {
             result.status = Status::Rejected;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             emit_order_rejected(id, side, price, quantity, timestamp, time_in_force, result.status);
             return finish_result(result);
         }
 
         if (is_active(id)) {
             result.status = Status::DuplicateOrderId;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             emit_order_rejected(id, side, price, quantity, timestamp, time_in_force, result.status);
             return finish_result(result);
         }
 
         const Status id_slot_status = can_insert_id();
-        if (time_in_force == TimeInForce::Fok && executable_quantity(side, quantity, price) < quantity) {
+        const Quantity executable = executable_quantity(side, quantity, price);
+        if (time_in_force == TimeInForce::Fok && executable < quantity) {
             result.status = Status::FokRejected;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             emit_order_rejected(id, side, price, quantity, timestamp, time_in_force, result.status);
             return finish_result(result);
         }
 
         if (time_in_force == TimeInForce::Gtc &&
             (id_slot_status != Status::Accepted || live_order_count_ == config_.max_orders) &&
-            executable_quantity(side, quantity, price) < quantity) {
+            executable < quantity) {
             result.status = residual_reject_status(id_slot_status);
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             emit_order_rejected(id, side, price, quantity, timestamp, time_in_force, result.status);
             return finish_result(result);
+        }
+
+        const std::uint32_t required_event_count =
+            required_limit_event_count(side, quantity, executable, true, price);
+        if (!start_event_operation(required_event_count)) {
+            result.accepted_quantity = 0;
+            return event_log_full_result(result);
         }
 
         event_log_.append_order(
@@ -374,12 +412,19 @@ public:
     [[nodiscard]] CancelResult cancel_order(const OrderId id, const Timestamp timestamp = 0)
     {
         CancelResult result{};
-        event_log_.begin_operation(1);
+        event_log_.begin_operation(0);
         auto order_it = orders_.find(id);
         if (order_it == orders_.end() || !order_it->second.active) {
             result.status = Status::UnknownOrderId;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             emit_order_rejected(id, Side::Buy, 0, 0, timestamp, TimeInForce::Gtc, result.status);
             return finish_result(result);
+        }
+
+        if (!start_event_operation(1)) {
+            return event_log_full_result(result);
         }
 
         ReferenceOrder& order = order_it->second;
@@ -401,9 +446,12 @@ public:
                                             const Timestamp timestamp = 0)
     {
         ModifyResult result{};
-        event_log_.begin_operation(1);
+        event_log_.begin_operation(0);
         if (new_quantity == 0) {
             result.status = Status::InvalidQuantity;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             emit_order_rejected(id, Side::Buy, 0, new_quantity, timestamp, TimeInForce::Gtc, result.status);
             return finish_result(result);
         }
@@ -411,8 +459,15 @@ public:
         auto order_it = orders_.find(id);
         if (order_it == orders_.end() || !order_it->second.active) {
             result.status = Status::UnknownOrderId;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             emit_order_rejected(id, Side::Buy, 0, new_quantity, timestamp, TimeInForce::Gtc, result.status);
             return finish_result(result);
+        }
+
+        if (!start_event_operation(1)) {
+            return event_log_full_result(result);
         }
 
         ReferenceOrder& order = order_it->second;
@@ -483,11 +538,14 @@ public:
         ReplaceResult result{};
         result.new_price = new_price;
         result.new_quantity = new_quantity;
-        event_log_.begin_operation(max_events_for_replace());
+        event_log_.begin_operation(0);
 
         auto order_it = orders_.find(id);
         if (order_it == orders_.end() || !order_it->second.active) {
             result.status = Status::UnknownOrderId;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             emit_order_rejected(id, Side::Buy, new_price, new_quantity, timestamp, time_in_force, result.status);
             return finish_result(result);
         }
@@ -502,6 +560,9 @@ public:
         const Status validation_status = validate_replacement_order(new_price, new_quantity);
         if (validation_status != Status::Accepted) {
             result.status = validation_status;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             event_log_.append_order(BookEvent::Kind::OrderRejected,
                                     result.status,
                                     id,
@@ -517,6 +578,9 @@ public:
 
         if (!valid_time_in_force(time_in_force)) {
             result.status = Status::Rejected;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             event_log_.append_order(BookEvent::Kind::OrderRejected,
                                     result.status,
                                     id,
@@ -531,6 +595,10 @@ public:
         }
 
         if (new_price == old_price && new_quantity <= old_quantity) {
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
+
             order.quantity = new_quantity;
             result.status = Status::Accepted;
             result.resting_quantity = new_quantity;
@@ -550,6 +618,9 @@ public:
         const Quantity executable = executable_quantity(side, new_quantity, new_price);
         if (time_in_force == TimeInForce::Fok && executable < new_quantity) {
             result.status = Status::FokRejected;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             event_log_.append_order(BookEvent::Kind::OrderRejected,
                                     result.status,
                                     id,
@@ -564,8 +635,13 @@ public:
         }
 
         if (time_in_force == TimeInForce::Gtc && executable < new_quantity) {
-            if (live_order_count_ == config_.max_orders) {
-                result.status = Status::PoolExhausted;
+            const Quantity residual_quantity = new_quantity - executable;
+            const Status storage_status = can_accept_replacement_residual(order, new_price, residual_quantity);
+            if (storage_status != Status::Accepted) {
+                result.status = storage_status;
+                if (!start_event_operation(1)) {
+                    return event_log_full_result(result);
+                }
                 event_log_.append_order(BookEvent::Kind::OrderRejected,
                                         result.status,
                                         id,
@@ -578,20 +654,12 @@ public:
                                         new_quantity);
                 return finish_result(result);
             }
-            if (live_order_count_ >= id_capacity_) {
-                result.status = Status::OrderIdMapFull;
-                event_log_.append_order(BookEvent::Kind::OrderRejected,
-                                        result.status,
-                                        id,
-                                        side,
-                                        new_price,
-                                        new_quantity,
-                                        timestamp,
-                                        time_in_force,
-                                        old_quantity,
-                                        new_quantity);
-                return finish_result(result);
-            }
+        }
+
+        const std::uint32_t required_event_count =
+            required_replace_event_count(side, new_quantity, executable, true, new_price);
+        if (!start_event_operation(required_event_count)) {
+            return event_log_full_result(result);
         }
 
         remove_from_level(side, old_price, id);
@@ -667,11 +735,23 @@ public:
                                                  const OrderId aggressor_id = kInvalidOrderId,
                                                  const Timestamp timestamp = 0)
     {
-        event_log_.begin_operation(max_events_for_market());
+        event_log_.begin_operation(0);
         if (quantity == 0) {
             MatchResult result{};
             result.status = Status::InvalidQuantity;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             emit_order_rejected(aggressor_id, aggressor_side, 0, quantity, timestamp, TimeInForce::Gtc, result.status);
+            return finish_result(result);
+        }
+
+        const std::uint32_t required_event_count = executable_fill_count(aggressor_side, quantity, false, 0);
+        if (!start_event_operation(required_event_count)) {
+            MatchResult result{};
+            result.status = Status::EventLogFull;
+            result.requested_quantity = quantity;
+            result.remaining_quantity = quantity;
             return finish_result(result);
         }
 
@@ -782,9 +862,8 @@ private:
         if (normalized.order_id_map_capacity == 0 && normalized.max_orders != 0) {
             normalized.order_id_map_capacity = saturated_double(normalized.max_orders);
         }
-        const std::uint32_t minimum_event_capacity = minimum_event_log_capacity(normalized.max_orders);
-        if (normalized.event_log_capacity < minimum_event_capacity) {
-            normalized.event_log_capacity = minimum_event_capacity;
+        if (normalized.event_log_capacity == 0) {
+            normalized.event_log_capacity = minimum_event_log_capacity(normalized.max_orders);
         }
         return normalized;
     }
@@ -860,6 +939,38 @@ private:
         return id_slot_status;
     }
 
+    [[nodiscard]] Status can_accept_replacement_residual(const ReferenceOrder& old_order,
+                                                         const Price new_price,
+                                                         const Quantity residual_quantity) const
+    {
+        if (residual_quantity == 0) {
+            return Status::Accepted;
+        }
+
+        const auto& levels = levels_for(old_order.side);
+        const auto old_level_it = levels.find(old_order.price);
+        CHECK(old_level_it != levels.end());
+
+        const auto target_level_it = levels.find(new_price);
+        if (target_level_it != levels.end()) {
+            Quantity target_quantity = level_depth(target_level_it->second);
+            if (new_price == old_order.price) {
+                CHECK(old_order.quantity <= target_quantity);
+                target_quantity -= old_order.quantity;
+            }
+            return std::numeric_limits<Quantity>::max() - target_quantity < residual_quantity
+                       ? Status::InternalError
+                       : Status::Accepted;
+        }
+
+        if (config_.price_level_mode != PriceLevelMode::Sparse || old_level_it->second.size() == 1U ||
+            levels.size() < config_.max_orders) {
+            return Status::Accepted;
+        }
+
+        return Status::PoolExhausted;
+    }
+
     [[nodiscard]] std::uint32_t max_events_for_add() const noexcept
     {
         if (live_order_count_ > std::numeric_limits<std::uint32_t>::max() - 2U) {
@@ -879,6 +990,62 @@ private:
     [[nodiscard]] std::uint32_t max_events_for_market() const noexcept
     {
         return std::max(1U, live_order_count_);
+    }
+
+    [[nodiscard]] bool start_event_operation(const std::uint32_t required_event_count)
+    {
+        if (!event_log_.can_record(required_event_count)) {
+            event_log_.begin_operation(0);
+            return false;
+        }
+
+        event_log_.begin_operation(required_event_count);
+        return true;
+    }
+
+    template <typename Result>
+    [[nodiscard]] Result event_log_full_result(Result result)
+    {
+        result.status = Status::EventLogFull;
+        return finish_result(result);
+    }
+
+    [[nodiscard]] static std::uint32_t saturated_add(const std::uint32_t lhs,
+                                                     const std::uint32_t rhs) noexcept
+    {
+        return rhs > std::numeric_limits<std::uint32_t>::max() - lhs
+                   ? std::numeric_limits<std::uint32_t>::max()
+                   : lhs + rhs;
+    }
+
+    [[nodiscard]] static std::uint32_t residual_event_count(const Quantity requested_quantity,
+                                                            const Quantity executable_quantity) noexcept
+    {
+        return executable_quantity < requested_quantity ? 1U : 0U;
+    }
+
+    [[nodiscard]] std::uint32_t required_limit_event_count(const Side aggressor_side,
+                                                           const Quantity requested_quantity,
+                                                           const Quantity executable_quantity,
+                                                           const bool has_limit_price,
+                                                           const Price limit_price) const
+    {
+        std::uint32_t required = 1U;
+        required = saturated_add(
+            required, executable_fill_count(aggressor_side, requested_quantity, has_limit_price, limit_price));
+        return saturated_add(required, residual_event_count(requested_quantity, executable_quantity));
+    }
+
+    [[nodiscard]] std::uint32_t required_replace_event_count(const Side aggressor_side,
+                                                             const Quantity requested_quantity,
+                                                             const Quantity executable_quantity,
+                                                             const bool has_limit_price,
+                                                             const Price limit_price) const
+    {
+        std::uint32_t required = 2U;
+        required = saturated_add(
+            required, executable_fill_count(aggressor_side, requested_quantity, has_limit_price, limit_price));
+        return saturated_add(required, residual_event_count(requested_quantity, executable_quantity));
     }
 
     void emit_order_rejected(const OrderId id,
@@ -992,6 +1159,60 @@ private:
         }
 
         return executable;
+    }
+
+    [[nodiscard]] std::uint32_t executable_fill_count(const Side aggressor_side,
+                                                      const Quantity requested_quantity,
+                                                      const bool has_limit_price,
+                                                      const Price limit_price) const
+    {
+        const Side resting_side = aggressor_side == Side::Buy ? Side::Sell : Side::Buy;
+        Quantity remaining = requested_quantity;
+        std::uint32_t fills = 0;
+
+        const auto count_level = [&](const Price price, const std::deque<OrderId>& level) {
+            if (has_limit_price && !crosses(resting_side, price, limit_price)) {
+                return false;
+            }
+
+            for (const OrderId id : level) {
+                const auto order_it = orders_.find(id);
+                CHECK(order_it != orders_.end());
+                CHECK(order_it->second.active);
+
+                const Quantity executed_quantity = std::min(remaining, order_it->second.quantity);
+                if (executed_quantity == 0) {
+                    return false;
+                }
+
+                remaining -= executed_quantity;
+                if (fills != std::numeric_limits<std::uint32_t>::max()) {
+                    ++fills;
+                }
+                if (remaining == 0) {
+                    return false;
+                }
+            }
+
+            return true;
+        };
+
+        if (resting_side == Side::Sell) {
+            for (const auto& [price, level] : asks_) {
+                if (!count_level(price, level)) {
+                    break;
+                }
+            }
+            return fills;
+        }
+
+        for (auto level_it = bids_.rbegin(); level_it != bids_.rend(); ++level_it) {
+            if (!count_level(level_it->first, level_it->second)) {
+                break;
+            }
+        }
+
+        return fills;
     }
 
     [[nodiscard]] bool best_price(const Side resting_side, Price& price) const
@@ -1437,6 +1658,530 @@ void run_engine_market(MatchingEngine& actual,
     check_engine_book_equal(actual, instrument_id, expected);
 }
 
+void check_command_equal(const Command& actual, const Command& expected)
+{
+    CHECK(actual.instrument_id == expected.instrument_id);
+    CHECK(actual.op == expected.op);
+    CHECK(actual.order_id == expected.order_id);
+    CHECK(actual.side == expected.side);
+    CHECK(actual.price == expected.price);
+    CHECK(actual.quantity == expected.quantity);
+    CHECK(actual.time_in_force == expected.time_in_force);
+    CHECK(actual.timestamp == expected.timestamp);
+}
+
+void check_dispatch_events(const DispatchResult& actual,
+                           const std::uint32_t expected_events_emitted,
+                           std::span<const BookEvent> expected_events,
+                           const char* context)
+{
+    CHECK(actual.events_emitted == expected_events_emitted);
+    CHECK(actual.events_emitted == actual.events.size());
+    CHECK(expected_events_emitted == expected_events.size());
+    check_event_stream(actual.events, expected_events, context);
+}
+
+void check_dispatch_add_result(const DispatchResult& actual,
+                               const AddOrderResult& expected,
+                               const char* context)
+{
+    check_status(actual.status, expected.status, context);
+    CHECK(actual.accepted_quantity == expected.accepted_quantity);
+    CHECK(actual.executed_quantity == expected.executed_quantity);
+    CHECK(actual.resting_quantity == expected.resting_quantity);
+    CHECK(actual.fills == expected.fills);
+    CHECK(actual.has_last_price == expected.has_last_price);
+    CHECK(actual.last_price == expected.last_price);
+    check_dispatch_events(actual, expected.events_emitted, expected.events, context);
+}
+
+void check_dispatch_cancel_result(const DispatchResult& actual,
+                                  const CancelResult& expected,
+                                  const char* context)
+{
+    check_status(actual.status, expected.status, context);
+    CHECK(actual.canceled_quantity == expected.canceled_quantity);
+    check_dispatch_events(actual, expected.events_emitted, expected.events, context);
+}
+
+void check_dispatch_modify_result(const DispatchResult& actual,
+                                  const ModifyResult& expected,
+                                  const char* context)
+{
+    check_status(actual.status, expected.status, context);
+    CHECK(actual.old_quantity == expected.old_quantity);
+    CHECK(actual.new_quantity == expected.new_quantity);
+    check_dispatch_events(actual, expected.events_emitted, expected.events, context);
+}
+
+void check_dispatch_replace_result(const DispatchResult& actual,
+                                   const ReplaceResult& expected,
+                                   const char* context)
+{
+    check_status(actual.status, expected.status, context);
+    CHECK(actual.old_price == expected.old_price);
+    CHECK(actual.new_price == expected.new_price);
+    CHECK(actual.old_quantity == expected.old_quantity);
+    CHECK(actual.new_quantity == expected.new_quantity);
+    CHECK(actual.executed_quantity == expected.executed_quantity);
+    CHECK(actual.resting_quantity == expected.resting_quantity);
+    CHECK(actual.fills == expected.fills);
+    CHECK(actual.has_last_price == expected.has_last_price);
+    CHECK(actual.last_price == expected.last_price);
+    check_dispatch_events(actual, expected.events_emitted, expected.events, context);
+}
+
+void check_dispatch_match_result(const DispatchResult& actual,
+                                 const MatchResult& expected,
+                                 const char* context)
+{
+    check_status(actual.status, expected.status, context);
+    CHECK(actual.requested_quantity == expected.requested_quantity);
+    CHECK(actual.executed_quantity == expected.executed_quantity);
+    CHECK(actual.remaining_quantity == expected.remaining_quantity);
+    CHECK(actual.fills == expected.fills);
+    CHECK(actual.has_last_price == expected.has_last_price);
+    CHECK(actual.last_price == expected.last_price);
+    check_dispatch_events(actual, expected.events_emitted, expected.events, context);
+}
+
+void run_dispatch_command(MatchingEngine& actual,
+                          ReferenceOrderBook& expected,
+                          const Command& command,
+                          const char* context)
+{
+    const DispatchResult actual_result = actual.dispatch(command);
+
+    switch (command.op) {
+    case CommandOp::Add: {
+        const AddOrderResult expected_result = expected.add_limit_order(command.order_id,
+                                                                        command.side,
+                                                                        command.price,
+                                                                        command.quantity,
+                                                                        command.timestamp,
+                                                                        command.time_in_force);
+        check_dispatch_add_result(actual_result, expected_result, context);
+        break;
+    }
+    case CommandOp::Cancel: {
+        const CancelResult expected_result = expected.cancel_order(command.order_id, command.timestamp);
+        check_dispatch_cancel_result(actual_result, expected_result, context);
+        break;
+    }
+    case CommandOp::Modify: {
+        const ModifyResult expected_result =
+            expected.modify_order(command.order_id, command.quantity, command.timestamp);
+        check_dispatch_modify_result(actual_result, expected_result, context);
+        break;
+    }
+    case CommandOp::Replace: {
+        const ReplaceResult expected_result = expected.replace_order(command.order_id,
+                                                                     command.price,
+                                                                     command.quantity,
+                                                                     command.timestamp,
+                                                                     command.time_in_force);
+        check_dispatch_replace_result(actual_result, expected_result, context);
+        break;
+    }
+    case CommandOp::Market: {
+        const MatchResult expected_result =
+            expected.match_market_order(command.side, command.quantity, command.order_id, command.timestamp);
+        check_dispatch_match_result(actual_result, expected_result, context);
+        break;
+    }
+    }
+
+    check_engine_book_equal(actual, command.instrument_id, expected);
+}
+
+void test_command_encode_decode_round_trip()
+{
+    constexpr InstrumentId instrument_id = 101;
+    constexpr std::array<CommandOp, 5> ops{
+        CommandOp::Add,
+        CommandOp::Cancel,
+        CommandOp::Modify,
+        CommandOp::Replace,
+        CommandOp::Market,
+    };
+
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+        const Command expected{instrument_id,
+                               ops[i],
+                               static_cast<OrderId>(10 + i),
+                               i % 2U == 0U ? Side::Buy : Side::Sell,
+                               static_cast<Price>(100 + static_cast<int>(i)),
+                               static_cast<Quantity>(5 + i),
+                               i % 3U == 0U ? TimeInForce::Gtc
+                                            : (i % 3U == 1U ? TimeInForce::Ioc : TimeInForce::Fok),
+                               static_cast<Timestamp>(1'000 + i)};
+        std::array<std::byte, kCommandWireSize> buffer{};
+        CHECK(encode(expected, buffer) == Status::Accepted);
+
+        Command actual{};
+        CHECK(decode(buffer, actual) == Status::Accepted);
+        check_command_equal(actual, expected);
+    }
+
+    const Command invalid_side{instrument_id,
+                               CommandOp::Add,
+                               1,
+                               static_cast<Side>(99U),
+                               100,
+                               1,
+                               TimeInForce::Gtc,
+                               1};
+    std::array<std::byte, kCommandWireSize> buffer{};
+    CHECK(encode(invalid_side, buffer) == Status::InvalidCommand);
+
+    Command decoded{};
+    CHECK(decode(std::span<const std::byte>(buffer.data(), kCommandWireSize - 1U), decoded) ==
+          Status::BufferTooSmall);
+
+    const Command valid{instrument_id, CommandOp::Add, 1, Side::Buy, 100, 1, TimeInForce::Gtc, 1};
+    CHECK(encode(valid, buffer) == Status::Accepted);
+    buffer[4] = static_cast<std::byte>(0xffU);
+    CHECK(decode(buffer, decoded) == Status::InvalidCommand);
+
+    CHECK(encode(valid, std::span<std::byte>(buffer.data(), kCommandWireSize - 1U)) ==
+          Status::BufferTooSmall);
+}
+
+void test_command_wire_format_exact_size_and_little_endian()
+{
+    static_assert(kCommandWireSize == 39U);
+
+    const Command command{0x01020304U,
+                          CommandOp::Replace,
+                          0x0102030405060708ULL,
+                          Side::Sell,
+                          0x1112131415161718LL,
+                          0x2122232425262728ULL,
+                          TimeInForce::Fok,
+                          0x3132333435363738ULL};
+
+    constexpr std::array<std::byte, kCommandWireSize> expected{
+        byte_value(0x04), byte_value(0x03), byte_value(0x02), byte_value(0x01),
+        byte_value(0x03),
+        byte_value(0x08), byte_value(0x07), byte_value(0x06), byte_value(0x05),
+        byte_value(0x04), byte_value(0x03), byte_value(0x02), byte_value(0x01),
+        byte_value(0x01),
+        byte_value(0x18), byte_value(0x17), byte_value(0x16), byte_value(0x15),
+        byte_value(0x14), byte_value(0x13), byte_value(0x12), byte_value(0x11),
+        byte_value(0x28), byte_value(0x27), byte_value(0x26), byte_value(0x25),
+        byte_value(0x24), byte_value(0x23), byte_value(0x22), byte_value(0x21),
+        byte_value(0x02),
+        byte_value(0x38), byte_value(0x37), byte_value(0x36), byte_value(0x35),
+        byte_value(0x34), byte_value(0x33), byte_value(0x32), byte_value(0x31),
+    };
+
+    std::array<std::byte, kCommandWireSize + 3U> buffer{};
+    buffer.fill(byte_value(0xaa));
+    CHECK(encode(command, buffer) == Status::Accepted);
+
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        CHECK(buffer[i] == expected[i]);
+    }
+    CHECK(buffer[kCommandWireSize] == byte_value(0xaa));
+    CHECK(buffer[kCommandWireSize + 1U] == byte_value(0xaa));
+    CHECK(buffer[kCommandWireSize + 2U] == byte_value(0xaa));
+
+    Command decoded{};
+    CHECK(decode(buffer, decoded) == Status::Accepted);
+    check_command_equal(decoded, command);
+}
+
+void test_dispatch_fixed_sequence_matches_oracle()
+{
+    constexpr InstrumentId instrument_id = 701;
+    const BookConfig config{90, 130, 128, 256, 1};
+    const InstrumentConfig configs[] = {
+        InstrumentConfig{instrument_id, config},
+    };
+
+    MatchingEngine actual(configs);
+    ReferenceOrderBook expected(config, instrument_id);
+    CHECK(actual.valid());
+
+    std::array<Command, 64> commands{};
+    std::uint32_t count = 0;
+
+    for (std::uint32_t i = 0; i < 20U; ++i) {
+        commands[count] = Command{instrument_id,
+                                  CommandOp::Add,
+                                  static_cast<OrderId>(1U + i),
+                                  Side::Buy,
+                                  static_cast<Price>(98 + static_cast<int>(i % 3U)),
+                                  static_cast<Quantity>(5U + (i % 4U)),
+                                  TimeInForce::Gtc,
+                                  count + 1U};
+        ++count;
+    }
+    for (std::uint32_t i = 0; i < 10U; ++i) {
+        commands[count] = Command{instrument_id,
+                                  CommandOp::Add,
+                                  static_cast<OrderId>(100U + i),
+                                  Side::Sell,
+                                  static_cast<Price>(105 + static_cast<int>(i % 2U)),
+                                  static_cast<Quantity>(4U + (i % 3U)),
+                                  TimeInForce::Gtc,
+                                  count + 1U};
+        ++count;
+    }
+    for (std::uint32_t i = 0; i < 8U; ++i) {
+        commands[count] = Command{instrument_id,
+                                  CommandOp::Modify,
+                                  static_cast<OrderId>(1U + i),
+                                  Side::Buy,
+                                  0,
+                                  static_cast<Quantity>(2U + (i % 3U)),
+                                  TimeInForce::Gtc,
+                                  count + 1U};
+        ++count;
+    }
+    for (std::uint32_t i = 0; i < 8U; ++i) {
+        commands[count] = Command{instrument_id,
+                                  CommandOp::Cancel,
+                                  static_cast<OrderId>(10U + i),
+                                  Side::Buy,
+                                  0,
+                                  0,
+                                  TimeInForce::Gtc,
+                                  count + 1U};
+        ++count;
+    }
+    for (std::uint32_t i = 0; i < 10U; ++i) {
+        commands[count] = Command{instrument_id,
+                                  CommandOp::Replace,
+                                  static_cast<OrderId>(100U + i),
+                                  Side::Sell,
+                                  static_cast<Price>(100 + static_cast<int>(i % 2U)),
+                                  static_cast<Quantity>(3U + (i % 4U)),
+                                  i % 3U == 0U ? TimeInForce::Ioc : TimeInForce::Gtc,
+                                  count + 1U};
+        ++count;
+    }
+    for (std::uint32_t i = 0; i < 8U; ++i) {
+        commands[count] = Command{instrument_id,
+                                  CommandOp::Market,
+                                  static_cast<OrderId>(900U + i),
+                                  i % 2U == 0U ? Side::Sell : Side::Buy,
+                                  0,
+                                  static_cast<Quantity>(1U + (i % 3U)),
+                                  TimeInForce::Gtc,
+                                  count + 1U};
+        ++count;
+    }
+
+    CHECK(count >= 50U);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        run_dispatch_command(actual, expected, commands[i], "dispatch_fixed_sequence");
+    }
+
+    const MatchingEngineStats stats = actual.stats();
+    CHECK(stats.dispatch_count == count);
+    CHECK(stats.adds == 30U);
+    CHECK(stats.modifies == 8U);
+    CHECK(stats.cancels == 8U);
+    CHECK(stats.replaces == 10U);
+    CHECK(stats.market_matches == 8U);
+    CHECK(stats.event_log_high_water_mark > 0U);
+}
+
+void test_dispatch_rejects_corrupt_and_truncated_buffers()
+{
+    constexpr InstrumentId instrument_id = 702;
+    const BookConfig config{90, 130, 16, 64, 1};
+    const InstrumentConfig configs[] = {
+        InstrumentConfig{instrument_id, config},
+    };
+
+    MatchingEngine engine(configs);
+    CHECK(engine.valid());
+
+    const Command valid{instrument_id, CommandOp::Add, 1, Side::Buy, 100, 5, TimeInForce::Gtc, 1};
+    std::array<std::byte, kCommandWireSize> buffer{};
+    CHECK(encode(valid, buffer) == Status::Accepted);
+
+    DispatchResult result =
+        engine.dispatch(std::span<const std::byte>(buffer.data(), kCommandWireSize - 1U));
+    CHECK(result.status == Status::BufferTooSmall);
+    CHECK(result.events_emitted == 0);
+    CHECK(engine.live_order_count(instrument_id) == 0);
+
+    buffer[4] = static_cast<std::byte>(0xffU);
+    result = engine.dispatch(buffer);
+    CHECK(result.status == Status::InvalidCommand);
+    CHECK(result.events_emitted == 0);
+    CHECK(engine.live_order_count(instrument_id) == 0);
+
+    Command invalid_op = valid;
+    invalid_op.op = static_cast<CommandOp>(99U);
+    result = engine.dispatch(invalid_op);
+    CHECK(result.status == Status::InvalidCommand);
+    CHECK(result.events_emitted == 0);
+    CHECK(engine.live_order_count(instrument_id) == 0);
+
+    Command unknown_instrument = valid;
+    unknown_instrument.instrument_id = 999;
+    result = engine.dispatch(unknown_instrument);
+    CHECK(result.status == Status::UnknownInstrument);
+    CHECK(result.events_emitted == 0);
+    CHECK(engine.live_order_count(instrument_id) == 0);
+
+    const MatchingEngineStats stats = engine.stats();
+    CHECK(stats.dispatch_count == 4U);
+    CHECK(stats.adds == 1U);
+    CHECK(stats.decode_errors == 2U);
+    CHECK(stats.rejects == 4U);
+    CHECK(stats.rejects_by_status[static_cast<std::size_t>(Status::BufferTooSmall)] == 1U);
+    CHECK(stats.rejects_by_status[static_cast<std::size_t>(Status::InvalidCommand)] == 2U);
+    CHECK(stats.rejects_by_status[static_cast<std::size_t>(Status::UnknownInstrument)] == 1U);
+}
+
+void test_dispatch_failure_results_have_empty_events_and_preserve_books()
+{
+    constexpr InstrumentId instrument_id = 704;
+    const BookConfig config{90, 130, 16, 64, 1};
+    const InstrumentConfig configs[] = {
+        InstrumentConfig{instrument_id, config},
+    };
+
+    MatchingEngine engine(configs);
+    CHECK(engine.valid());
+
+    const AddOrderResult resting = engine.add_limit_order(instrument_id, 1, Side::Buy, 100, 5, 1);
+    CHECK(resting.status == Status::Accepted);
+    CHECK(resting.events_emitted == 2U);
+    const std::span<const BookEvent> initial_events = engine.last_events(instrument_id);
+    CHECK(initial_events.size() == 2U);
+    const BookEvent* const initial_events_data = initial_events.data();
+
+    const Command valid{instrument_id, CommandOp::Add, 2, Side::Buy, 99, 3, TimeInForce::Gtc, 2};
+    std::array<std::byte, kCommandWireSize> buffer{};
+    CHECK(encode(valid, buffer) == Status::Accepted);
+
+    DispatchResult result =
+        engine.dispatch(std::span<const std::byte>(buffer.data(), kCommandWireSize - 1U));
+    CHECK(result.status == Status::BufferTooSmall);
+    CHECK(result.events_emitted == 0U);
+    CHECK(result.events.empty());
+    CHECK(engine.live_order_count(instrument_id) == 1U);
+    CHECK(engine.last_events(instrument_id).data() == initial_events_data);
+    CHECK(engine.last_events(instrument_id).size() == initial_events.size());
+
+    buffer[4] = byte_value(0xff);
+    result = engine.dispatch(buffer);
+    CHECK(result.status == Status::InvalidCommand);
+    CHECK(result.events_emitted == 0U);
+    CHECK(result.events.empty());
+    CHECK(engine.live_order_count(instrument_id) == 1U);
+    CHECK(engine.last_events(instrument_id).data() == initial_events_data);
+    CHECK(engine.last_events(instrument_id).size() == initial_events.size());
+
+    Command unknown_instrument = valid;
+    unknown_instrument.instrument_id = 999;
+    result = engine.dispatch(unknown_instrument);
+    CHECK(result.status == Status::UnknownInstrument);
+    CHECK(result.events_emitted == 0U);
+    CHECK(result.events.empty());
+    CHECK(engine.live_order_count(instrument_id) == 1U);
+    CHECK(engine.depth_at_price(instrument_id, Side::Buy, 100) == 5U);
+    CHECK(engine.find_order(instrument_id, 1) != nullptr);
+    CHECK(engine.find_order(instrument_id, 2) == nullptr);
+    CHECK(engine.last_events(instrument_id).data() == initial_events_data);
+    CHECK(engine.last_events(instrument_id).size() == initial_events.size());
+}
+
+void test_event_log_full_policy()
+{
+    const BookConfig config{90, 130, 4, 16, 1, 2};
+    OrderBook actual(config);
+    ReferenceOrderBook expected(config);
+    CHECK(actual.event_log_capacity() == 2U);
+
+    run_add(actual, expected, 1, Side::Sell, 100, 1, 1);
+    run_add(actual, expected, 2, Side::Sell, 101, 1, 2);
+
+    const AddOrderResult actual_result = actual.add_limit_order(3, Side::Buy, 101, 2, 3);
+    const AddOrderResult expected_result = expected.add_limit_order(3, Side::Buy, 101, 2, 3);
+    check_add_result(actual_result, expected_result, "event_log_full_add");
+    CHECK(actual_result.status == Status::EventLogFull);
+    CHECK(actual_result.events_emitted == 0);
+    CHECK(actual.find_order(1) != nullptr);
+    CHECK(actual.find_order(2) != nullptr);
+    CHECK(actual.find_order(3) == nullptr);
+    CHECK(actual.depth_at_price(Side::Sell, 100) == 1U);
+    CHECK(actual.depth_at_price(Side::Sell, 101) == 1U);
+    check_books_equal(actual, expected);
+}
+
+[[nodiscard]] Price random_valid_price(SplitMix64& rng) noexcept
+{
+    return static_cast<Price>(90 + static_cast<int>(rng.uniform(41U)));
+}
+
+[[nodiscard]] Quantity random_nonzero_quantity(SplitMix64& rng) noexcept
+{
+    return static_cast<Quantity>(1U + rng.uniform(16U));
+}
+
+[[nodiscard]] OrderId random_valid_command_order_id(SplitMix64& rng) noexcept
+{
+    return static_cast<OrderId>(1U + rng.uniform(96U));
+}
+
+void test_dispatch_seeded_replay_stream_matches_oracle()
+{
+    constexpr InstrumentId instrument_id = 703;
+    const BookConfig config{90, 130, 128, 256, 1};
+    const InstrumentConfig configs[] = {
+        InstrumentConfig{instrument_id, config},
+    };
+
+    MatchingEngine actual(configs);
+    ReferenceOrderBook expected(config, instrument_id);
+    SplitMix64 rng(0x4449535041544348ULL);
+
+    for (std::uint32_t step = 0; step < 750U; ++step) {
+        const std::uint32_t action = rng.uniform(100U);
+        Command command{};
+        command.instrument_id = instrument_id;
+        command.order_id = random_valid_command_order_id(rng);
+        command.side = random_side(rng);
+        command.price = random_valid_price(rng);
+        command.quantity = random_nonzero_quantity(rng);
+        command.time_in_force = TimeInForce::Gtc;
+        command.timestamp = static_cast<Timestamp>(step + 1U);
+
+        if (action < 45U) {
+            command.op = CommandOp::Add;
+            command.time_in_force = random_time_in_force(rng);
+        } else if (action < 60U) {
+            command.op = CommandOp::Cancel;
+        } else if (action < 75U) {
+            command.op = CommandOp::Modify;
+        } else if (action < 90U) {
+            command.op = CommandOp::Replace;
+            command.time_in_force = random_time_in_force(rng);
+        } else {
+            command.op = CommandOp::Market;
+            command.order_id = static_cast<OrderId>(800'000U + step);
+        }
+
+        run_dispatch_command(actual, expected, command, "dispatch_seeded_replay");
+    }
+
+    const MatchingEngineStats stats = actual.stats();
+    CHECK(stats.dispatch_count == 750U);
+    CHECK(stats.adds > 0U);
+    CHECK(stats.cancels > 0U);
+    CHECK(stats.modifies > 0U);
+    CHECK(stats.replaces > 0U);
+    CHECK(stats.market_matches > 0U);
+    CHECK(stats.event_log_high_water_mark > 0U);
+}
+
 void test_fifo_and_price_priority()
 {
     const BookConfig config{90, 110, 16, 64, 1};
@@ -1539,7 +2284,7 @@ void test_replace_crossing_price_executes_before_resting()
     CHECK(actual.find_order(1) == nullptr);
 }
 
-void test_replace_rejected_on_pool_full_preserves_book()
+void test_replace_reuses_existing_order_slot_when_pool_full()
 {
     const BookConfig config{90, 110, 2, 16, 1};
     OrderBook actual(config);
@@ -1550,28 +2295,172 @@ void test_replace_rejected_on_pool_full_preserves_book()
 
     const ReplaceResult actual_result = actual.replace_order(1, 97, 5, 3, TimeInForce::Gtc);
     const ReplaceResult expected_result = expected.replace_order(1, 97, 5, 3, TimeInForce::Gtc);
-    check_replace_result(actual_result, expected_result, "replace_pool_full");
+    check_replace_result(actual_result, expected_result, "replace_reuse_pool_slot");
     check_books_equal(actual, expected);
 
-    CHECK(actual_result.status == Status::PoolExhausted);
-    CHECK(actual_result.events_emitted == 1);
+    CHECK(actual_result.status == Status::Accepted);
+    CHECK(actual_result.executed_quantity == 0);
+    CHECK(actual_result.resting_quantity == 5);
+    CHECK(actual_result.events_emitted == 3);
     check_order_event_fields(
-        actual_result.events[0], BookEvent::Kind::OrderRejected, Status::PoolExhausted, 1, Side::Buy, 97, 5, 3);
-    CHECK(actual_result.events[0].old_quantity == 5);
-    CHECK(actual_result.events[0].new_quantity == 5);
+        actual_result.events[0], BookEvent::Kind::OrderCancelled, Status::Cancelled, 1, Side::Buy, 99, 5, 3);
+    check_order_event_fields(
+        actual_result.events[1], BookEvent::Kind::OrderAccepted, Status::Accepted, 1, Side::Buy, 97, 5, 3);
+    check_order_event_fields(
+        actual_result.events[2], BookEvent::Kind::OrderResting, Status::Accepted, 1, Side::Buy, 97, 5, 3);
+    CHECK(actual_result.events[1].old_quantity == 5);
+    CHECK(actual_result.events[1].new_quantity == 5);
+    CHECK(actual_result.events[2].old_quantity == 5);
+    CHECK(actual_result.events[2].new_quantity == 5);
 
     const Order* first = actual.find_order(1);
     const Order* second = actual.find_order(2);
     CHECK(first != nullptr);
-    CHECK(first->price == 99);
+    CHECK(first->price == 97);
     CHECK(first->quantity == 5);
     CHECK(second != nullptr);
     CHECK(second->price == 98);
     CHECK(second->quantity == 7);
     CHECK(actual.live_order_count() == 2);
-    CHECK(actual.best_bid().price == 99);
-    CHECK(actual.depth_at_price(Side::Buy, 99) == 5);
+    CHECK(actual.best_bid().price == 98);
+    CHECK(actual.depth_at_price(Side::Buy, 99) == 0);
     CHECK(actual.depth_at_price(Side::Buy, 98) == 7);
+    CHECK(actual.depth_at_price(Side::Buy, 97) == 5);
+}
+
+void test_replace_reuses_existing_order_id_when_id_map_full()
+{
+    const BookConfig config{90, 110, 4, 2, 1};
+    OrderBook actual(config);
+    ReferenceOrderBook expected(config);
+
+    run_add(actual, expected, 1, Side::Buy, 99, 5, 1);
+    run_add(actual, expected, 2, Side::Buy, 98, 7, 2);
+
+    const OrderBookStats before_stats = actual.stats();
+    CHECK(before_stats.order_id_map.size == before_stats.order_id_map.capacity);
+
+    const ReplaceResult actual_result = actual.replace_order(1, 97, 5, 3, TimeInForce::Gtc);
+    const ReplaceResult expected_result = expected.replace_order(1, 97, 5, 3, TimeInForce::Gtc);
+    check_replace_result(actual_result, expected_result, "replace_reuse_order_id");
+    check_books_equal(actual, expected);
+
+    CHECK(actual_result.status == Status::Accepted);
+    CHECK(actual_result.resting_quantity == 5);
+    CHECK(actual_result.events_emitted == 3);
+    check_order_event_fields(
+        actual_result.events[0], BookEvent::Kind::OrderCancelled, Status::Cancelled, 1, Side::Buy, 99, 5, 3);
+    check_order_event_fields(
+        actual_result.events[1], BookEvent::Kind::OrderAccepted, Status::Accepted, 1, Side::Buy, 97, 5, 3);
+    check_order_event_fields(
+        actual_result.events[2], BookEvent::Kind::OrderResting, Status::Accepted, 1, Side::Buy, 97, 5, 3);
+
+    const Order* first = actual.find_order(1);
+    CHECK(first != nullptr);
+    CHECK(first->price == 97);
+    CHECK(first->quantity == 5);
+    CHECK(actual.find_order(2) != nullptr);
+    CHECK(actual.stats().order_id_map.size == before_stats.order_id_map.size);
+}
+
+void test_sparse_replace_reuses_freed_level_when_level_storage_full()
+{
+    const BookConfig config{1, 1'000, 3, 16, 1, 0, PriceLevelMode::Sparse};
+    OrderBook actual(config);
+    ReferenceOrderBook expected(config);
+
+    run_add(actual, expected, 1, Side::Buy, 100, 5, 1);
+    run_add(actual, expected, 2, Side::Buy, 200, 7, 2);
+    run_add(actual, expected, 3, Side::Buy, 300, 9, 3);
+
+    OrderBookStats stats = actual.stats();
+    CHECK(stats.bids.mode == PriceLevelMode::Sparse);
+    CHECK(stats.bids.level_storage_capacity == config.max_orders);
+    CHECK(stats.bids.occupied_level_count == stats.bids.level_storage_capacity);
+
+    const ReplaceResult actual_result = actual.replace_order(1, 400, 5, 4, TimeInForce::Gtc);
+    const ReplaceResult expected_result = expected.replace_order(1, 400, 5, 4, TimeInForce::Gtc);
+    check_replace_result(actual_result, expected_result, "sparse_replace_reuses_freed_level");
+    check_books_equal(actual, expected);
+
+    CHECK(actual_result.status == Status::Accepted);
+    CHECK(actual_result.executed_quantity == 0U);
+    CHECK(actual_result.resting_quantity == 5U);
+    CHECK(actual_result.events_emitted == 3U);
+    CHECK(actual.depth_at_price(Side::Buy, 100) == 0U);
+    CHECK(actual.depth_at_price(Side::Buy, 200) == 7U);
+    CHECK(actual.depth_at_price(Side::Buy, 300) == 9U);
+    CHECK(actual.depth_at_price(Side::Buy, 400) == 5U);
+    CHECK(actual.find_order(1) != nullptr);
+    CHECK(actual.find_order(1)->price == 400);
+    CHECK(actual.live_order_count() == 3U);
+
+    stats = actual.stats();
+    CHECK(stats.bids.occupied_level_count == stats.bids.level_storage_capacity);
+    CHECK(stats.bids.occupied_level_count == 3U);
+}
+
+void test_replace_rejects_when_residual_level_cannot_store_quantity()
+{
+    const BookConfig config{90, 110, 3, 16, 1};
+    OrderBook actual(config);
+    ReferenceOrderBook expected(config);
+    constexpr Quantity max_quantity = std::numeric_limits<Quantity>::max();
+
+    run_add(actual, expected, 1, Side::Buy, 100, 5, 1);
+    run_add(actual, expected, 2, Side::Buy, 101, max_quantity - 5U, 2);
+
+    const ReplaceResult actual_result = actual.replace_order(1, 101, 6, 3, TimeInForce::Gtc);
+    const ReplaceResult expected_result = expected.replace_order(1, 101, 6, 3, TimeInForce::Gtc);
+    check_replace_result(actual_result, expected_result, "replace_residual_quantity_capacity");
+    check_books_equal(actual, expected);
+
+    CHECK(actual_result.status == Status::InternalError);
+    CHECK(actual_result.events_emitted == 1);
+    check_order_event_fields(
+        actual_result.events[0], BookEvent::Kind::OrderRejected, Status::InternalError, 1, Side::Buy, 101, 6, 3);
+    CHECK(actual_result.events[0].old_quantity == 5);
+    CHECK(actual_result.events[0].new_quantity == 6);
+
+    const Order* first = actual.find_order(1);
+    const Order* second = actual.find_order(2);
+    CHECK(first != nullptr);
+    CHECK(first->price == 100);
+    CHECK(first->quantity == 5);
+    CHECK(second != nullptr);
+    CHECK(second->price == 101);
+    CHECK(second->quantity == max_quantity - 5U);
+    CHECK(actual.live_order_count() == 2);
+    CHECK(actual.depth_at_price(Side::Buy, 100) == 5);
+    CHECK(actual.depth_at_price(Side::Buy, 101) == max_quantity - 5U);
+}
+
+void test_replace_event_log_full_preserves_book()
+{
+    const BookConfig config{90, 110, 4, 16, 1, 3};
+    OrderBook actual(config);
+    ReferenceOrderBook expected(config);
+
+    run_add(actual, expected, 1, Side::Sell, 100, 5, 1);
+    run_add(actual, expected, 2, Side::Buy, 99, 8, 2);
+
+    const ReplaceResult actual_result = actual.replace_order(2, 100, 8, 3, TimeInForce::Gtc);
+    const ReplaceResult expected_result = expected.replace_order(2, 100, 8, 3, TimeInForce::Gtc);
+    check_replace_result(actual_result, expected_result, "replace_event_log_full");
+    check_books_equal(actual, expected);
+
+    CHECK(actual_result.status == Status::EventLogFull);
+    CHECK(actual_result.events_emitted == 0);
+    CHECK(actual.find_order(1) != nullptr);
+    CHECK(actual.find_order(1)->price == 100);
+    CHECK(actual.find_order(1)->quantity == 5);
+    CHECK(actual.find_order(2) != nullptr);
+    CHECK(actual.find_order(2)->price == 99);
+    CHECK(actual.find_order(2)->quantity == 8);
+    CHECK(actual.live_order_count() == 2);
+    CHECK(actual.depth_at_price(Side::Sell, 100) == 5);
+    CHECK(actual.depth_at_price(Side::Buy, 99) == 8);
+    CHECK(actual.depth_at_price(Side::Buy, 100) == 0);
 }
 
 void test_replace_ioc_and_fok_paths()
@@ -2341,6 +3230,38 @@ void test_book_snapshot_continue_trading_matches_fresh()
     check_book_snapshots_equal(restored, fresh, "snapshot_continue_market_state");
 }
 
+void test_book_snapshot_restore_preserves_event_sequence_numbering()
+{
+    const BookConfig config{90, 130, 32, 128, 1};
+    OrderBook fresh(config);
+
+    const AddOrderResult first = fresh.add_limit_order(1, Side::Buy, 100, 5, 1);
+    CHECK(first.status == Status::Accepted);
+    CHECK(first.events.size() == 2U);
+    const AddOrderResult second = fresh.add_limit_order(2, Side::Sell, 105, 7, 2);
+    CHECK(second.status == Status::Accepted);
+    CHECK(second.events.size() == 2U);
+    CHECK(second.events.front().sequence == first.events.back().sequence + 1U);
+
+    const SequenceNumber last_sequence_before_snapshot = fresh.last_events().back().sequence;
+
+    std::array<std::byte, kSnapshotTestBufferSize> buffer{};
+    const SnapshotWriteResult snapshot = serialize(fresh, buffer);
+    CHECK(snapshot.status == Status::Accepted);
+
+    OrderBook restored(config);
+    CHECK(restore(restored, std::span<const std::byte>(buffer.data(), snapshot.bytes_written)) == Status::Accepted);
+    CHECK(restored.last_events().empty());
+
+    const AddOrderResult fresh_add = fresh.add_limit_order(3, Side::Buy, 99, 4, 3, TimeInForce::Gtc);
+    const AddOrderResult restored_add = restored.add_limit_order(3, Side::Buy, 99, 4, 3, TimeInForce::Gtc);
+    check_add_result(restored_add, fresh_add, "snapshot_restore_event_sequence");
+    CHECK(restored_add.events.size() == 2U);
+    CHECK(restored_add.events.front().sequence == last_sequence_before_snapshot + 1U);
+    CHECK(restored_add.events.back().sequence == restored_add.events.front().sequence + 1U);
+    check_book_snapshots_equal(restored, fresh, "snapshot_restore_event_sequence_state");
+}
+
 void test_engine_snapshot_round_trip_multi_instrument()
 {
     constexpr InstrumentId instrument_a = 501;
@@ -2438,6 +3359,66 @@ void test_snapshot_rejects_corrupt_and_truncated_buffers()
         const Status status = restore(target, std::span<const std::byte>(buffer.data(), length));
         CHECK(status != Status::Accepted);
     }
+}
+
+void test_snapshot_rejects_crossed_book_without_mutating_target()
+{
+    const BookConfig config{90, 110, 16, 64, 1, 64, PriceLevelMode::Dense};
+    OrderBook source(config);
+    CHECK(source.add_limit_order(1, Side::Buy, 100, 5, 1).status == Status::Accepted);
+    CHECK(source.add_limit_order(2, Side::Sell, 105, 7, 2).status == Status::Accepted);
+
+    std::array<std::byte, kSnapshotTestBufferSize> buffer{};
+    const SnapshotWriteResult snapshot = serialize(source, buffer);
+    CHECK(snapshot.status == Status::Accepted);
+    CHECK(snapshot.bytes_written == detail::kBookHeaderWireSize + 2U * detail::kBookOrderWireSize +
+                                        2U * detail::kLevelWireSize);
+
+    const std::size_t ask_order_price =
+        detail::kBookHeaderWireSize + detail::kBookOrderWireSize + sizeof(OrderId) + sizeof(std::uint8_t);
+    const std::size_t ask_level_price = detail::kBookHeaderWireSize + 2U * detail::kBookOrderWireSize +
+                                        detail::kLevelWireSize + sizeof(std::uint8_t);
+    const auto crossed_price = static_cast<std::uint64_t>(100);
+    const std::span<std::byte> snapshot_bytes(buffer.data(), snapshot.bytes_written);
+    write_u64_le(snapshot_bytes, ask_order_price, crossed_price);
+    write_u64_le(snapshot_bytes, ask_level_price, crossed_price);
+
+    OrderBook target(config);
+    OrderBook expected(config);
+    CHECK(target.add_limit_order(50, Side::Buy, 95, 3, 10).status == Status::Accepted);
+    CHECK(expected.add_limit_order(50, Side::Buy, 95, 3, 10).status == Status::Accepted);
+
+    CHECK(restore(target, snapshot_bytes) == Status::SnapshotFormatMismatch);
+    check_book_snapshots_equal(target, expected, "crossed_snapshot_atomic_rejection");
+}
+
+void test_snapshot_rejects_fifo_sequence_regression_without_mutating_target()
+{
+    const BookConfig config{90, 110, 16, 64, 1, 64, PriceLevelMode::Sparse};
+    OrderBook source(config);
+    CHECK(source.add_limit_order(1, Side::Buy, 100, 5, 1).status == Status::Accepted);
+    CHECK(source.add_limit_order(2, Side::Buy, 100, 7, 2).status == Status::Accepted);
+
+    std::array<std::byte, kSnapshotTestBufferSize> buffer{};
+    const SnapshotWriteResult snapshot = serialize(source, buffer);
+    CHECK(snapshot.status == Status::Accepted);
+
+    constexpr std::size_t sequence_field_offset =
+        sizeof(OrderId) + sizeof(std::uint8_t) + sizeof(Price) + sizeof(Quantity) + sizeof(Timestamp);
+    const std::size_t first_sequence = detail::kBookHeaderWireSize + sequence_field_offset;
+    const std::size_t second_sequence =
+        detail::kBookHeaderWireSize + detail::kBookOrderWireSize + sequence_field_offset;
+    const std::span<std::byte> snapshot_bytes(buffer.data(), snapshot.bytes_written);
+    write_u64_le(snapshot_bytes, first_sequence, 2);
+    write_u64_le(snapshot_bytes, second_sequence, 1);
+
+    OrderBook target(config);
+    OrderBook expected(config);
+    CHECK(target.add_limit_order(50, Side::Sell, 108, 3, 10).status == Status::Accepted);
+    CHECK(expected.add_limit_order(50, Side::Sell, 108, 3, 10).status == Status::Accepted);
+
+    CHECK(restore(target, snapshot_bytes) == Status::SnapshotFormatMismatch);
+    check_book_snapshots_equal(target, expected, "fifo_sequence_snapshot_atomic_rejection");
 }
 
 void run_seeded_conformance(const std::uint64_t seed)
@@ -2636,11 +3617,22 @@ void test_seeded_multi_instrument_conformance()
 
 int main()
 {
+    test_command_encode_decode_round_trip();
+    test_command_wire_format_exact_size_and_little_endian();
+    test_dispatch_fixed_sequence_matches_oracle();
+    test_dispatch_rejects_corrupt_and_truncated_buffers();
+    test_dispatch_failure_results_have_empty_events_and_preserve_books();
+    test_event_log_full_policy();
+    test_dispatch_seeded_replay_stream_matches_oracle();
     test_fifo_and_price_priority();
     test_reduce_keeps_priority_and_increase_rejects();
     test_replace_price_change_loses_priority();
     test_replace_crossing_price_executes_before_resting();
-    test_replace_rejected_on_pool_full_preserves_book();
+    test_replace_reuses_existing_order_slot_when_pool_full();
+    test_replace_reuses_existing_order_id_when_id_map_full();
+    test_sparse_replace_reuses_freed_level_when_level_storage_full();
+    test_replace_rejects_when_residual_level_cannot_store_quantity();
+    test_replace_event_log_full_preserves_book();
     test_replace_ioc_and_fok_paths();
     test_modify_reduce_equivalent_to_replace_reduce();
     test_pool_exhaustion_preserves_resting_liquidity();
@@ -2662,8 +3654,11 @@ int main()
     test_matching_engine_unknown_instrument_rejects_without_side_effects();
     test_book_snapshot_round_trip_random_ops();
     test_book_snapshot_continue_trading_matches_fresh();
+    test_book_snapshot_restore_preserves_event_sequence_numbering();
     test_engine_snapshot_round_trip_multi_instrument();
     test_snapshot_rejects_corrupt_and_truncated_buffers();
+    test_snapshot_rejects_crossed_book_without_mutating_target();
+    test_snapshot_rejects_fifo_sequence_regression_without_mutating_target();
     test_seeded_conformance();
     test_sparse_seeded_conformance();
     test_seeded_multi_instrument_conformance();

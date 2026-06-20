@@ -32,7 +32,13 @@ enum class TimeInForce : std::uint8_t {
 };
 
 enum class PriceLevelMode : std::uint8_t {
+    /// Flat price-indexed storage over every configured tick.
     Dense,
+    /// Fixed-capacity sparse storage for wide price ranges.
+    ///
+    /// Each side can occupy at most `BookConfig::max_orders` price levels.
+    /// Level creation/removal is bounded by that capacity; order FIFO within a
+    /// level remains intrusive and allocation-free after construction.
     Sparse,
 };
 
@@ -68,11 +74,15 @@ enum class Status : std::uint8_t {
     SnapshotVersionMismatch,
     SnapshotConfigurationMismatch,
     SnapshotCapacityExceeded,
+    InvalidCommand,
+    EventLogFull,
 
     // Compatibility aliases for older call sites.
     Ok = Accepted,
     OrderNotFound = UnknownOrderId,
 };
+
+inline constexpr std::size_t kStatusCount = static_cast<std::size_t>(Status::EventLogFull) + 1U;
 
 struct TradeEvent final {
     InstrumentId instrument_id{kInvalidInstrumentId};
@@ -121,7 +131,9 @@ struct BookConfig final {
     std::uint32_t max_orders{0};
     std::uint32_t order_id_map_capacity{0};
     Price tick_size{1};
+    /// `0` selects the default capacity sized for the configured order limit.
     std::uint32_t event_log_capacity{0};
+    /// Selects dense or sparse fixed storage for price levels.
     PriceLevelMode price_level_mode{PriceLevelMode::Dense};
 
     [[nodiscard]] bool valid() const noexcept
@@ -192,6 +204,16 @@ struct MatchingEngineStats final {
     double order_pool_utilization{0.0};
     double order_id_map_utilization{0.0};
     OrderIdMapStats aggregate_order_id_map{};
+    std::uint64_t dispatch_count{0};
+    std::uint64_t adds{0};
+    std::uint64_t cancels{0};
+    std::uint64_t modifies{0};
+    std::uint64_t replaces{0};
+    std::uint64_t market_matches{0};
+    std::uint64_t rejects{0};
+    std::array<std::uint64_t, kStatusCount> rejects_by_status{};
+    std::uint32_t event_log_high_water_mark{0};
+    std::uint64_t decode_errors{0};
 };
 
 struct InstrumentConfig final {
@@ -245,7 +267,7 @@ struct AddOrderResult final {
     bool has_last_price{false};
     Price last_price{0};
     std::uint32_t events_emitted{0};
-    // OrderBook-owned storage; valid until the next mutating call on that book.
+    /// OrderBook-owned storage; valid until the next mutating call on that book.
     std::span<const BookEvent> events{};
 };
 
@@ -253,7 +275,7 @@ struct CancelResult final {
     Status status{Status::InternalError};
     Quantity canceled_quantity{0};
     std::uint32_t events_emitted{0};
-    // OrderBook-owned storage; valid until the next mutating call on that book.
+    /// OrderBook-owned storage; valid until the next mutating call on that book.
     std::span<const BookEvent> events{};
 };
 
@@ -262,7 +284,7 @@ struct ModifyResult final {
     Quantity old_quantity{0};
     Quantity new_quantity{0};
     std::uint32_t events_emitted{0};
-    // OrderBook-owned storage; valid until the next mutating call on that book.
+    /// OrderBook-owned storage; valid until the next mutating call on that book.
     std::span<const BookEvent> events{};
 };
 
@@ -278,7 +300,7 @@ struct ReplaceResult final {
     bool has_last_price{false};
     Price last_price{0};
     std::uint32_t events_emitted{0};
-    // OrderBook-owned storage; valid until the next mutating call on that book.
+    /// OrderBook-owned storage; valid until the next mutating call on that book.
     std::span<const BookEvent> events{};
 };
 
@@ -291,7 +313,32 @@ struct MatchResult final {
     bool has_last_price{false};
     Price last_price{0};
     std::uint32_t events_emitted{0};
-    // OrderBook-owned storage; valid until the next mutating call on that book.
+    /// OrderBook-owned storage; valid until the next mutating call on that book.
+    std::span<const BookEvent> events{};
+};
+
+/// Common return shape for `MatchingEngine::dispatch`.
+///
+/// Fields are populated according to the routed operation. Decode failures,
+/// invalid commands, and unknown instruments return an empty `events` span and
+/// do not begin a book event-log operation.
+struct DispatchResult final {
+    Status status{Status::InternalError};
+    Quantity accepted_quantity{0};
+    Quantity requested_quantity{0};
+    Quantity executed_quantity{0};
+    Quantity remaining_quantity{0};
+    Quantity resting_quantity{0};
+    Quantity canceled_quantity{0};
+    Quantity old_quantity{0};
+    Quantity new_quantity{0};
+    Price old_price{0};
+    Price new_price{0};
+    std::uint32_t fills{0};
+    bool has_last_price{false};
+    Price last_price{0};
+    std::uint32_t events_emitted{0};
+    /// OrderBook-owned storage; valid until the next mutating call on that book.
     std::span<const BookEvent> events{};
 };
 
@@ -304,9 +351,29 @@ class OrderBook;
 class MatchingEngine;
 struct SnapshotAccess;
 
+/// Serialize a book snapshot into caller-owned storage.
+///
+/// The snapshot is a deterministic little-endian byte stream. `bytes_written`
+/// is nonzero only on `Status::Accepted`.
 [[nodiscard]] SnapshotWriteResult serialize(const OrderBook& book, std::span<std::byte> out_buffer) noexcept;
+
+/// Serialize an engine snapshot into caller-owned storage.
+///
+/// The engine snapshot includes each configured instrument in construction
+/// order and embeds deterministic book snapshots for their current state.
 [[nodiscard]] SnapshotWriteResult serialize(const MatchingEngine& engine, std::span<std::byte> out_buffer) noexcept;
+
+/// Restore an already constructed book from a validated snapshot.
+///
+/// Validation failures return before clearing the target. Accepted restores emit
+/// no events, clear `last_events()`, and preserve subsequent order and event
+/// sequence numbering.
 [[nodiscard]] Status restore(OrderBook& book, std::span<const std::byte> buffer) noexcept;
+
+/// Restore an already constructed engine with matching instrument configuration.
+///
+/// The full engine snapshot is validated before any contained book is restored.
+/// Accepted restores emit no events for restored books.
 [[nodiscard]] Status restore(MatchingEngine& engine, std::span<const std::byte> buffer) noexcept;
 
 [[nodiscard]] constexpr bool is_buy(const Side side) noexcept

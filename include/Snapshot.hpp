@@ -529,6 +529,14 @@ inline void write_level(SnapshotWriter& writer, const BookSnapshotLevelAggregate
         if (previous_order.id == order.id) {
             return Status::SnapshotFormatMismatch;
         }
+        if (previous_order.sequence == order.sequence &&
+            order.sequence != std::numeric_limits<SequenceNumber>::max()) {
+            return Status::SnapshotFormatMismatch;
+        }
+        if (previous_order.side == order.side && previous_order.price == order.price &&
+            previous_order.sequence > order.sequence) {
+            return Status::SnapshotFormatMismatch;
+        }
     }
 
     return Status::Accepted;
@@ -639,12 +647,32 @@ inline void write_level(SnapshotWriter& writer, const BookSnapshotLevelAggregate
         return Status::SnapshotFormatMismatch;
     }
 
+    bool has_bid = false;
+    bool has_ask = false;
+    Price best_bid = 0;
+    Price best_ask = 0;
     for (std::uint32_t order_index = 0; order_index < header.order_count; ++order_index) {
         BookSnapshotOrder order{};
         status = validate_order_record(buffer, header, order_index, order);
         if (status != Status::Accepted) {
             return status;
         }
+
+        if (order.side == Side::Buy) {
+            if (!has_bid || order.price > best_bid) {
+                best_bid = order.price;
+            }
+            has_bid = true;
+        } else {
+            if (!has_ask || order.price < best_ask) {
+                best_ask = order.price;
+            }
+            has_ask = true;
+        }
+    }
+
+    if (has_bid && has_ask && best_bid >= best_ask) {
+        return Status::SnapshotFormatMismatch;
     }
 
     for (std::uint32_t level_index = 0; level_index < header.level_count; ++level_index) {

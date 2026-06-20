@@ -37,8 +37,19 @@ cmake --build build-codex-release --target eigenbook_bench
 - Reported latency uses `std::chrono::steady_clock` around fixed 64-operation sample blocks and reports nanoseconds per operation for each block.
 - Reported total time and throughput use wall-clock time around the full scenario loop.
 - p50, p95, and p99 are computed after sorting samples outside the timed region.
+- Replay dispatch pre-encodes fixed command bytes before timing; the timed loop
+  decodes each command and routes it through `MatchingEngine::dispatch`.
 
 Because timing still has measurement overhead and is not CPU-pinned, the absolute nanosecond numbers should be treated as local development signals, not exchange-grade latency claims.
+
+On Linux, optional hardware-counter sampling can be run outside CI with:
+
+```sh
+perf stat -e cycles,instructions,branches,branch-misses,cache-references,cache-misses ./build-codex-release/eigenbook_bench
+```
+
+Do not gate CI on `perf`, and do not record counter or latency claims unless the
+hardware, compiler, build flags, and command line are captured with the results.
 
 ## Workloads
 
@@ -53,15 +64,16 @@ Because timing still has measurement overhead and is not CPU-pinned, the absolut
 | FOK rejects | Submit FOK buys with no executable liquidity |
 | FOK full matches | Preload sell liquidity, then submit fully executable FOK buys |
 | Mixed workload | 50% adds, 25% cancels, 15% modifies, 10% executions |
+| Replay dispatch commands | Decode fixed binary commands and route through `MatchingEngine::dispatch` |
 | Serialize book snapshot | Serialize a 256-order book into caller-provided storage |
 | Restore book snapshot | Restore a 256-order book into an already constructed target |
 
 ## Results
 
 Release run from this workspace on the hardware and compiler above. This table
-predates the replace, IOC/FOK, and snapshot workload rows, so it should not be
-used for those latency claims until `eigenbook_bench` is rerun and the
-hardware/compiler context is recorded with the new output.
+predates the replace, IOC/FOK, replay dispatch, and snapshot workload rows, so
+it should not be used for those latency claims until `eigenbook_bench` is rerun
+and the hardware/compiler context is recorded with the new output.
 
 ```text
 Eigen-Book microbenchmarks (50000 operations per scenario)
@@ -79,16 +91,12 @@ Eigen-Book microbenchmarks (50000 operations per scenario)
 - The process is not pinned to a core.
 - CPU frequency and macOS scheduler effects are not controlled.
 - The timer cost is amortized across 64-operation samples.
-- There are no Linux `perf` counters yet.
-- There is no probe-length histogram for `OrderIdMap` yet.
+- Linux `perf stat` is optional and not part of CI.
 - The dense price array works best when the configured price range is compact.
 
 ## Future Improvements
 
-- custom flat hash map with probe-length metrics
 - arena-backed event log
-- binary protocol ingestion
-- market data replay benchmarks
 - lock-free SPSC queue integration boundary
 - larger multi-instrument snapshot benchmarks
 - add larger configurable batch timing mode

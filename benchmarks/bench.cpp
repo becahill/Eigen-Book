@@ -1,3 +1,5 @@
+#include "Command.hpp"
+#include "MatchingEngine.hpp"
 #include "OrderBook.hpp"
 #include "Snapshot.hpp"
 
@@ -258,10 +260,12 @@ template <typename Fn>
 
 [[nodiscard]] BenchmarkResult benchmark_ioc_partial_matches(const std::uint32_t operations)
 {
-    OrderBook book(make_config(operations + 16U));
+    const BookConfig config{1, static_cast<Price>(operations + 100U), operations + 16U, (operations + 16U) * 4U};
+    OrderBook book(config);
 
     for (std::uint32_t i = 0; i < operations; ++i) {
-        const AddOrderResult result = book.add_limit_order(static_cast<OrderId>(i + 1U), Side::Sell, 100, 1);
+        const AddOrderResult result =
+            book.add_limit_order(static_cast<OrderId>(i + 1U), Side::Sell, static_cast<Price>(100U + i), 1);
         if (result.status != Status::Accepted) {
             std::abort();
         }
@@ -269,7 +273,7 @@ template <typename Fn>
 
     return run_benchmark("IOC partial matches", operations, [&](const std::uint32_t i) {
         const AddOrderResult result =
-            book.add_limit_order(10'000'000ULL + i, Side::Buy, 100, 2, 0, TimeInForce::Ioc);
+            book.add_limit_order(10'000'000ULL + i, Side::Buy, static_cast<Price>(100U + i), 2, 0, TimeInForce::Ioc);
         if (result.status != Status::PartiallyFilled || result.resting_quantity != 0) {
             std::abort();
         }
@@ -416,6 +420,116 @@ struct Event final {
     });
 }
 
+[[nodiscard]] BenchmarkResult benchmark_replay_dispatch(const std::uint32_t operations)
+{
+    constexpr InstrumentId instrument_id = 1;
+    constexpr std::uint32_t pattern = 20;
+    const std::uint32_t add_count = (operations * 8U) / pattern;
+    const std::uint32_t cancel_count = (operations * 4U) / pattern;
+    const std::uint32_t modify_count = (operations * 3U) / pattern;
+    const std::uint32_t replace_count = (operations * 3U) / pattern;
+    const std::uint32_t execute_count = operations - add_count - cancel_count - modify_count - replace_count;
+    const BookConfig config = make_config(operations + 256U);
+    const InstrumentConfig instruments[] = {
+        InstrumentConfig{instrument_id, config},
+    };
+    MatchingEngine engine(instruments);
+    std::vector<std::array<std::byte, kCommandWireSize>> encoded(operations);
+    std::vector<Status> expected_statuses(operations);
+
+    for (std::uint32_t i = 0; i < cancel_count; ++i) {
+        const AddOrderResult result =
+            engine.add_limit_order(instrument_id, static_cast<OrderId>(10'000'000ULL + i), Side::Buy, 90, 100);
+        if (result.status != Status::Accepted) {
+            std::abort();
+        }
+    }
+
+    for (std::uint32_t i = 0; i < modify_count; ++i) {
+        const AddOrderResult result =
+            engine.add_limit_order(instrument_id, static_cast<OrderId>(20'000'000ULL + i), Side::Buy, 91, 100);
+        if (result.status != Status::Accepted) {
+            std::abort();
+        }
+    }
+
+    for (std::uint32_t i = 0; i < replace_count; ++i) {
+        const AddOrderResult result =
+            engine.add_limit_order(instrument_id, static_cast<OrderId>(30'000'000ULL + i), Side::Buy, 92, 100);
+        if (result.status != Status::Accepted) {
+            std::abort();
+        }
+    }
+
+    for (std::uint32_t i = 0; i < execute_count; ++i) {
+        const AddOrderResult result =
+            engine.add_limit_order(instrument_id, static_cast<OrderId>(40'000'000ULL + i), Side::Sell, 100, 1);
+        if (result.status != Status::Accepted) {
+            std::abort();
+        }
+    }
+
+    std::uint32_t add_index = 0;
+    std::uint32_t cancel_index = 0;
+    std::uint32_t modify_index = 0;
+    std::uint32_t replace_index = 0;
+    std::uint32_t execute_index = 0;
+    for (std::uint32_t i = 0; i < operations; ++i) {
+        const std::uint32_t slot = i % pattern;
+        Command command{};
+        command.instrument_id = instrument_id;
+        command.side = Side::Buy;
+        command.time_in_force = TimeInForce::Gtc;
+        command.timestamp = i + 1U;
+
+        if (slot < 8U) {
+            command.op = CommandOp::Add;
+            command.order_id = static_cast<OrderId>(50'000'000ULL + add_index);
+            command.price = 93;
+            command.quantity = 100;
+            expected_statuses[i] = Status::Accepted;
+            ++add_index;
+        } else if (slot < 12U) {
+            command.op = CommandOp::Cancel;
+            command.order_id = static_cast<OrderId>(10'000'000ULL + cancel_index);
+            expected_statuses[i] = Status::Cancelled;
+            ++cancel_index;
+        } else if (slot < 15U) {
+            command.op = CommandOp::Modify;
+            command.order_id = static_cast<OrderId>(20'000'000ULL + modify_index);
+            command.quantity = 99;
+            expected_statuses[i] = Status::Accepted;
+            ++modify_index;
+        } else if (slot < 18U) {
+            command.op = CommandOp::Replace;
+            command.order_id = static_cast<OrderId>(30'000'000ULL + replace_index);
+            command.price = 94;
+            command.quantity = 100;
+            expected_statuses[i] = Status::Accepted;
+            ++replace_index;
+        } else {
+            command.op = CommandOp::Market;
+            command.order_id = static_cast<OrderId>(60'000'000ULL + execute_index);
+            command.side = Side::Buy;
+            command.quantity = 1;
+            expected_statuses[i] = Status::Filled;
+            ++execute_index;
+        }
+
+        if (encode(command, encoded[i]) != Status::Accepted) {
+            std::abort();
+        }
+    }
+
+    return run_benchmark("Replay dispatch commands", operations, [&](const std::uint32_t i) {
+        const DispatchResult result = engine.dispatch(
+            std::span<const std::byte>(encoded[i].data(), encoded[i].size()));
+        if (result.status != expected_statuses[i]) {
+            std::abort();
+        }
+    });
+}
+
 [[nodiscard]] BenchmarkResult benchmark_snapshot_serialize(const std::uint32_t operations)
 {
     constexpr std::uint32_t live_orders = 256;
@@ -501,6 +615,7 @@ int main()
     const BenchmarkResult fok_reject = benchmark_fok_rejects(operations);
     const BenchmarkResult fok_accept = benchmark_fok_accepts(operations);
     const BenchmarkResult mixed = benchmark_mixed_workload(operations);
+    const BenchmarkResult replay_dispatch = benchmark_replay_dispatch(operations);
     const BenchmarkResult snapshot_serialize = benchmark_snapshot_serialize(operations);
     const BenchmarkResult snapshot_restore = benchmark_snapshot_restore(operations);
 
@@ -518,6 +633,7 @@ int main()
     print_result(fok_reject);
     print_result(fok_accept);
     print_result(mixed);
+    print_result(replay_dispatch);
     print_result(snapshot_serialize);
     print_result(snapshot_restore);
     return 0;

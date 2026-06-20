@@ -15,7 +15,10 @@ deterministic behavior after construction.
 - GTC, IOC, and FOK limit order time-in-force semantics
 - market order matching
 - fixed-capacity event log with order and trade events
+- explicit `Status::EventLogFull` rejection when a configured event log cannot
+  record a full operation
 - fixed-capacity `MatchingEngine` routing across configured instruments
+- fixed-size binary `Command` wire format and `MatchingEngine::dispatch`
 - best-first market depth API with caller-provided buffers
 - deterministic snapshot/restore for books and multi-instrument engines
 - O(1) cancellation after id lookup
@@ -83,6 +86,11 @@ Every mutating operation returns a result struct with `events_emitted` and
 internal fixed-capacity `EventLog`; it is valid until the next mutating call on
 the same book.
 
+`BookConfig::event_log_capacity == 0` selects the default operation-safe
+capacity. A nonzero capacity is treated as an explicit cap. If an operation
+would emit more events than that cap, it returns `Status::EventLogFull`, emits
+no events, and leaves the book unchanged.
+
 `BookEvent` and nested `TradeEvent` both carry `instrument_id`. Direct
 `OrderBook` users get `kInvalidInstrumentId` by default; books owned by
 `MatchingEngine` are constructed with their configured instrument id, so the
@@ -144,6 +152,19 @@ returns the number of levels written. Bid levels are best-first descending by
 price; ask levels are best-first ascending by price. Each `DepthLevel` contains
 `price`, `aggregate_quantity`, and `order_count`.
 
+## Production API
+
+| Surface | Contract |
+|---|---|
+| `MatchingEngine::dispatch(const Command&)` | Single routing entry point for add, cancel, modify, replace, and market commands. Structurally invalid commands return `Status::InvalidCommand`; unknown instruments do not mutate books. |
+| `Command` wire format | Fixed 39-byte little-endian record in `include/Command.hpp`: `instrument_id`, `op`, `order_id`, `side`, `price`, `quantity`, `time_in_force`, `timestamp`. `encode`/`decode` return explicit `Status`. |
+| Stats | `MatchingEngine::stats()` keeps existing utilization fields and adds dispatch op counters, total rejects, `rejects_by_status`, decode errors, and event-log high-water mark. |
+| Snapshot | Snapshot wire format remains version 2 for books and engines. Callers provide storage; corrupt, truncated, mismatched, or undersized buffers return explicit status values. |
+| Sparse mode | `PriceLevelMode::Sparse` avoids dense allocation across wide price universes while preserving fixed capacity and bounded behavior. |
+| TIF | Limit adds and lose-priority replaces support `Gtc`, `Ioc`, and `Fok`; FOK preflights full quantity before mutation. |
+| Replace policy | Same-price reductions keep priority. Price changes and same-price increases use cancel/reinsert semantics and lose priority. |
+| Event lifetime | Result `events` spans are owned by the target `OrderBook` and remain valid until the next mutating call on that same book. `EventLogFull` returns an empty span with no mutation. |
+
 ## Usage Example
 
 `examples/basic_usage.cpp` is a standalone, compiled example showing how to:
@@ -158,6 +179,10 @@ price; ask levels are best-first ascending by price. Each `DepthLevel` contains
 `examples/snapshot_usage.cpp` shows how to serialize a book into caller-owned
 storage, restore into an already constructed empty book, and continue trading.
 
+`examples/replay_usage.cpp` shows a fixed byte-array command replay through
+`decode` and `MatchingEngine::dispatch` across two instruments, printing event
+summaries and aggregate stats.
+
 Build and run it from any configured build directory:
 
 ```sh
@@ -165,6 +190,8 @@ cmake --build build-debug --target eigenbook_basic_usage
 ./build-debug/eigenbook_basic_usage
 cmake --build build-debug --target eigenbook_snapshot_usage
 ./build-debug/eigenbook_snapshot_usage
+cmake --build build-debug --target eigenbook_replay_usage
+./build-debug/eigenbook_replay_usage
 ```
 
 IOC and FOK are selected with the optional final `TimeInForce` parameter:
@@ -208,8 +235,9 @@ cmake --build build-release --target eigenbook_bench
 ```
 
 The benchmark target is dependency-free and measures add, cancel, modify,
-replace, market-match, IOC/FOK limit-order paths, and mixed workloads. See
-`docs/performance.md` for methodology, local recorded results, and limitations.
+replace, market-match, IOC/FOK limit-order paths, mixed workloads, replay
+dispatch, and snapshot workloads. See `docs/performance.md` for methodology,
+local recorded results, and limitations.
 Do not update benchmark numbers without rerunning locally and recording
 hardware/compiler context.
 
@@ -231,11 +259,47 @@ Then run:
 ctest --test-dir build-sanitize
 ```
 
+## Optional Fuzzing
+
+Clang builds can enable dependency-free libFuzzer harnesses for the command
+decoder and snapshot restore path. Each fuzzer is compiled with libFuzzer,
+AddressSanitizer, and UndefinedBehaviorSanitizer; fuzzing remains outside the
+matching engine and is disabled by default.
+
+```sh
+cmake -S . -B build-fuzz \
+  -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DEIGENBOOK_BUILD_FUZZERS=ON \
+  -DEIGENBOOK_BUILD_BENCHMARKS=OFF \
+  -DEIGENBOOK_BUILD_EXAMPLES=OFF
+cmake --build build-fuzz --parallel \
+  --target eigenbook_command_fuzzer eigenbook_snapshot_fuzzer
+```
+
+The build deterministically generates valid command, dense snapshot, and sparse
+snapshot seeds under `build-fuzz/fuzz-corpus`. Run longer local campaigns with:
+
+```sh
+./build-fuzz/eigenbook_command_fuzzer \
+  -max_len=4096 -max_total_time=300 build-fuzz/fuzz-corpus/command
+./build-fuzz/eigenbook_snapshot_fuzzer \
+  -max_len=4096 -max_total_time=300 build-fuzz/fuzz-corpus/snapshot
+```
+
+Re-run a saved crash artifact by passing its path directly to the corresponding
+fuzzer. The bounded CI-equivalent smoke runs are registered with CTest:
+
+```sh
+ctest --test-dir build-fuzz --output-on-failure -L fuzz
+```
+
 ## Build Options
 
 - `EIGENBOOK_BUILD_TESTS=ON`: build `eigenbook_tests`
 - `EIGENBOOK_BUILD_BENCHMARKS=ON`: build `eigenbook_bench`
 - `EIGENBOOK_BUILD_EXAMPLES=ON`: build `eigenbook_basic_usage`
+- `EIGENBOOK_BUILD_FUZZERS=ON`: optionally build Clang libFuzzer + ASAN + UBSAN harnesses (default `OFF`)
 - `EIGENBOOK_ENABLE_ASAN=OFF`: toggle AddressSanitizer
 - `EIGENBOOK_ENABLE_UBSAN=OFF`: toggle UndefinedBehaviorSanitizer
 
@@ -243,4 +307,5 @@ ctest --test-dir build-sanitize
 
 GitHub Actions is configured in `.github/workflows/ci.yml`. It runs Debug,
 Release, and combined ASAN/UBSAN builds, runs the test suite, and compiles the
-benchmark target without running benchmark timing in CI.
+benchmark target without running benchmark timing in CI. A separate Clang job
+builds both fuzzers and executes their fixed 256-run smoke tests.

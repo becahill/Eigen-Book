@@ -94,6 +94,34 @@ public:
         return Status::Accepted;
     }
 
+    [[nodiscard]] Status can_accept_replacement_residual(const Order& old_order,
+                                                         const Price new_price,
+                                                         const Quantity residual_quantity) const noexcept
+    {
+        if (residual_quantity == 0) {
+            return Status::Accepted;
+        }
+        if (old_order.side != side_ || !price_in_range(old_order.price) || !price_in_range(new_price) ||
+            old_order.level == nullptr) {
+            return Status::InternalError;
+        }
+
+        const std::uint32_t target_index = index_for_price(new_price);
+        const PriceLevel& target_level = levels_[target_index];
+        Quantity target_quantity = target_level.total_quantity();
+
+        if (new_price == old_order.price) {
+            if (old_order.level != &target_level || old_order.quantity > target_quantity) {
+                return Status::InternalError;
+            }
+            target_quantity -= old_order.quantity;
+        }
+
+        return std::numeric_limits<Quantity>::max() - target_quantity < residual_quantity
+                   ? Status::InternalError
+                   : Status::Accepted;
+    }
+
     [[nodiscard]] Status remove_order(Order& order) noexcept
     {
         if (order.side != side_ || !price_in_range(order.price)) {
@@ -149,6 +177,39 @@ public:
         }
 
         return executable;
+    }
+
+    [[nodiscard]] std::uint32_t executable_fill_count(const Quantity requested_quantity,
+                                                      const bool has_limit_price,
+                                                      const Price limit_price) const noexcept
+    {
+        Quantity remaining = requested_quantity;
+        std::uint32_t fills = 0;
+        std::uint32_t index = best_index_;
+
+        while (remaining > 0 && index != kInvalidIndex) {
+            const PriceLevel& level = levels_[index];
+            if (has_limit_price && !crosses(level.price(), limit_price)) {
+                break;
+            }
+
+            const Order* order = level.front();
+            while (remaining > 0 && order != nullptr) {
+                const Quantity executed_quantity = std::min(remaining, order->quantity);
+                if (executed_quantity == 0) {
+                    return fills;
+                }
+                remaining -= executed_quantity;
+                if (fills != std::numeric_limits<std::uint32_t>::max()) {
+                    ++fills;
+                }
+                order = order->next;
+            }
+
+            index = find_next_index_after(index);
+        }
+
+        return fills;
     }
 
     [[nodiscard]] MatchResult match(const Quantity requested_quantity,
@@ -597,6 +658,46 @@ public:
         return Status::Accepted;
     }
 
+    [[nodiscard]] Status can_accept_replacement_residual(const Order& old_order,
+                                                         const Price new_price,
+                                                         const Quantity residual_quantity) const noexcept
+    {
+        if (residual_quantity == 0) {
+            return Status::Accepted;
+        }
+        if (old_order.side != side_ || !price_in_range(old_order.price) || !price_in_range(new_price) ||
+            old_order.level == nullptr) {
+            return Status::InternalError;
+        }
+
+        const std::uint32_t old_slot = find_slot(old_order.price);
+        if (old_slot == kInvalidIndex || old_order.level != &levels_[old_slot]) {
+            return Status::InternalError;
+        }
+
+        const std::uint32_t target_slot = find_slot(new_price);
+        if (target_slot != kInvalidIndex) {
+            const PriceLevel& target_level = levels_[target_slot];
+            Quantity target_quantity = target_level.total_quantity();
+            if (target_slot == old_slot) {
+                if (old_order.quantity > target_quantity) {
+                    return Status::InternalError;
+                }
+                target_quantity -= old_order.quantity;
+            }
+
+            return std::numeric_limits<Quantity>::max() - target_quantity < residual_quantity
+                       ? Status::InternalError
+                       : Status::Accepted;
+        }
+
+        if (occupied_level_count_ < level_capacity_ || levels_[old_slot].order_count() == 1U) {
+            return Status::Accepted;
+        }
+
+        return Status::PoolExhausted;
+    }
+
     [[nodiscard]] Status remove_order(Order& order) noexcept
     {
         if (order.side != side_ || !price_in_range(order.price)) {
@@ -661,6 +762,39 @@ public:
         }
 
         return executable;
+    }
+
+    [[nodiscard]] std::uint32_t executable_fill_count(const Quantity requested_quantity,
+                                                      const bool has_limit_price,
+                                                      const Price limit_price) const noexcept
+    {
+        Quantity remaining = requested_quantity;
+        std::uint32_t fills = 0;
+        std::uint32_t slot = best_slot_;
+
+        while (remaining > 0 && slot != kInvalidIndex) {
+            const PriceLevel& level = levels_[slot];
+            if (has_limit_price && !crosses(level.price(), limit_price)) {
+                break;
+            }
+
+            const Order* order = level.front();
+            while (remaining > 0 && order != nullptr) {
+                const Quantity executed_quantity = std::min(remaining, order->quantity);
+                if (executed_quantity == 0) {
+                    return fills;
+                }
+                remaining -= executed_quantity;
+                if (fills != std::numeric_limits<std::uint32_t>::max()) {
+                    ++fills;
+                }
+                order = order->next;
+            }
+
+            slot = find_next_slot_after(slot);
+        }
+
+        return fills;
     }
 
     [[nodiscard]] MatchResult match(const Quantity requested_quantity,
@@ -1201,6 +1335,14 @@ public:
         return sparse() ? sparse_side().add_order(order) : dense_side().add_order(order);
     }
 
+    [[nodiscard]] Status can_accept_replacement_residual(const Order& old_order,
+                                                         const Price new_price,
+                                                         const Quantity residual_quantity) const noexcept
+    {
+        return sparse() ? sparse_side().can_accept_replacement_residual(old_order, new_price, residual_quantity)
+                        : dense_side().can_accept_replacement_residual(old_order, new_price, residual_quantity);
+    }
+
     [[nodiscard]] Status remove_order(Order& order) noexcept
     {
         return sparse() ? sparse_side().remove_order(order) : dense_side().remove_order(order);
@@ -1218,6 +1360,14 @@ public:
     {
         return sparse() ? sparse_side().executable_quantity(requested_quantity, has_limit_price, limit_price)
                         : dense_side().executable_quantity(requested_quantity, has_limit_price, limit_price);
+    }
+
+    [[nodiscard]] std::uint32_t executable_fill_count(const Quantity requested_quantity,
+                                                      const bool has_limit_price,
+                                                      const Price limit_price) const noexcept
+    {
+        return sparse() ? sparse_side().executable_fill_count(requested_quantity, has_limit_price, limit_price)
+                        : dense_side().executable_fill_count(requested_quantity, has_limit_price, limit_price);
     }
 
     [[nodiscard]] MatchResult match(const Quantity requested_quantity,

@@ -12,6 +12,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(EIGENBOOK_BUILD_TESTS "Build Eigen-Book unit tests" ON)
 option(EIGENBOOK_BUILD_BENCHMARKS "Build Eigen-Book benchmark executable" ON)
 option(EIGENBOOK_BUILD_EXAMPLES "Build Eigen-Book usage examples" ON)
+option(EIGENBOOK_BUILD_FUZZERS "Build Clang libFuzzer harnesses" OFF)
 option(EIGENBOOK_ENABLE_ASAN "Enable AddressSanitizer on supported compilers" OFF)
 option(EIGENBOOK_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer on supported compilers" OFF)
 
@@ -81,4 +82,83 @@ if(EIGENBOOK_BUILD_EXAMPLES)
     add_executable(eigenbook_snapshot_usage
         examples/snapshot_usage.cpp)
     target_link_libraries(eigenbook_snapshot_usage PRIVATE EigenBook::eigenbook)
+
+    add_executable(eigenbook_replay_usage
+        examples/replay_usage.cpp)
+    target_link_libraries(eigenbook_replay_usage PRIVATE EigenBook::eigenbook)
+endif()
+
+if(EIGENBOOK_BUILD_FUZZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
+        message(FATAL_ERROR "EIGENBOOK_BUILD_FUZZERS requires Clang with libFuzzer support")
+    endif()
+
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_FLAGS_SAVE "${CMAKE_REQUIRED_FLAGS}")
+    set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} -fsanitize=fuzzer")
+    check_cxx_source_compiles(
+        "#include <cstddef>\n#include <cstdint>\nextern \"C\" int LLVMFuzzerTestOneInput(const std::uint8_t*, std::size_t) { return 0; }"
+        EIGENBOOK_HAS_LIBFUZZER)
+    set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS_SAVE}")
+    unset(CMAKE_REQUIRED_FLAGS_SAVE)
+    if(NOT EIGENBOOK_HAS_LIBFUZZER)
+        message(FATAL_ERROR
+            "EIGENBOOK_BUILD_FUZZERS requires a Clang installation that includes the libFuzzer runtime")
+    endif()
+
+    function(eigenbook_add_fuzzer target source)
+        add_executable(${target} ${source})
+        target_link_libraries(${target} PRIVATE EigenBook::eigenbook)
+        target_compile_options(${target} PRIVATE
+            -fsanitize=fuzzer,address,undefined
+            -fno-omit-frame-pointer)
+        target_link_options(${target} PRIVATE
+            -fsanitize=fuzzer,address,undefined)
+    endfunction()
+
+    eigenbook_add_fuzzer(eigenbook_command_fuzzer fuzz/fuzz_command_decode.cpp)
+    eigenbook_add_fuzzer(eigenbook_snapshot_fuzzer fuzz/fuzz_snapshot_restore.cpp)
+
+    add_executable(eigenbook_generate_fuzz_corpus
+        fuzz/generate_corpus.cpp)
+    target_link_libraries(eigenbook_generate_fuzz_corpus PRIVATE EigenBook::eigenbook)
+
+    set(EIGENBOOK_FUZZ_CORPUS_DIR "${CMAKE_CURRENT_BINARY_DIR}/fuzz-corpus")
+    set(EIGENBOOK_COMMAND_CORPUS_DIR "${EIGENBOOK_FUZZ_CORPUS_DIR}/command")
+    set(EIGENBOOK_SNAPSHOT_CORPUS_DIR "${EIGENBOOK_FUZZ_CORPUS_DIR}/snapshot")
+    set(EIGENBOOK_FUZZ_CORPUS_FILES
+        "${EIGENBOOK_COMMAND_CORPUS_DIR}/add"
+        "${EIGENBOOK_COMMAND_CORPUS_DIR}/replace"
+        "${EIGENBOOK_SNAPSHOT_CORPUS_DIR}/dense"
+        "${EIGENBOOK_SNAPSHOT_CORPUS_DIR}/sparse")
+
+    add_custom_command(
+        OUTPUT ${EIGENBOOK_FUZZ_CORPUS_FILES}
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "${EIGENBOOK_COMMAND_CORPUS_DIR}"
+            "${EIGENBOOK_SNAPSHOT_CORPUS_DIR}"
+        COMMAND $<TARGET_FILE:eigenbook_generate_fuzz_corpus> "${EIGENBOOK_FUZZ_CORPUS_DIR}"
+        DEPENDS eigenbook_generate_fuzz_corpus
+        VERBATIM)
+    add_custom_target(eigenbook_fuzz_corpus ALL
+        DEPENDS ${EIGENBOOK_FUZZ_CORPUS_FILES})
+    add_dependencies(eigenbook_command_fuzzer eigenbook_fuzz_corpus)
+    add_dependencies(eigenbook_snapshot_fuzzer eigenbook_fuzz_corpus)
+
+    if(BUILD_TESTING)
+        add_test(NAME eigenbook_fuzz_command_smoke
+            COMMAND eigenbook_command_fuzzer
+                -runs=256
+                -max_len=4096
+                "${EIGENBOOK_COMMAND_CORPUS_DIR}")
+        add_test(NAME eigenbook_fuzz_snapshot_smoke
+            COMMAND eigenbook_snapshot_fuzzer
+                -runs=256
+                -max_len=4096
+                "${EIGENBOOK_SNAPSHOT_CORPUS_DIR}")
+        set_tests_properties(
+            eigenbook_fuzz_command_smoke
+            eigenbook_fuzz_snapshot_smoke
+            PROPERTIES TIMEOUT 60 LABELS fuzz)
+    endif()
 endif()

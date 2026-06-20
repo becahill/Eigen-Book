@@ -43,17 +43,23 @@ public:
     {
         AddOrderResult result{};
         result.accepted_quantity = quantity;
-        event_log_.begin_operation(max_events_for_add());
+        event_log_.begin_operation(0);
 
         const Status validation_status = validate_new_order(id, price, quantity);
         if (validation_status != Status::Accepted) {
             result.status = validation_status;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             emit_order_rejected(id, side, price, quantity, timestamp, time_in_force, validation_status);
             return finish_result(result);
         }
 
         if (!valid_time_in_force(time_in_force)) {
             result.status = Status::Rejected;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             emit_order_rejected(id, side, price, quantity, timestamp, time_in_force, result.status);
             return finish_result(result);
         }
@@ -61,15 +67,21 @@ public:
         const Status id_slot_status = order_ids_.can_insert(id);
         if (id_slot_status == Status::DuplicateOrderId || id_slot_status == Status::InvalidOrderId) {
             result.status = id_slot_status;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             emit_order_rejected(id, side, price, quantity, timestamp, time_in_force, id_slot_status);
             return finish_result(result);
         }
 
         BookSide& contra_side = side == Side::Buy ? asks_ : bids_;
+        const Quantity executable_quantity = contra_side.executable_quantity(quantity, true, price);
 
-        if (time_in_force == TimeInForce::Fok &&
-            contra_side.executable_quantity(quantity, true, price) < quantity) {
+        if (time_in_force == TimeInForce::Fok && executable_quantity < quantity) {
             result.status = Status::FokRejected;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             emit_order_rejected(id, side, price, quantity, timestamp, time_in_force, result.status);
             return finish_result(result);
         }
@@ -78,10 +90,20 @@ public:
         // persist its residual in the fixed order pool or fixed id map.
         if (time_in_force == TimeInForce::Gtc &&
             (id_slot_status != Status::Accepted || orders_.available() == 0U) &&
-            contra_side.executable_quantity(quantity, true, price) < quantity) {
+            executable_quantity < quantity) {
             result.status = residual_reject_status(id_slot_status);
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             emit_order_rejected(id, side, price, quantity, timestamp, time_in_force, result.status);
             return finish_result(result);
+        }
+
+        const std::uint32_t required_event_count =
+            required_limit_event_count(contra_side, quantity, executable_quantity, true, price);
+        if (!start_event_operation(required_event_count)) {
+            result.accepted_quantity = 0;
+            return event_log_full_result(result);
         }
 
         event_log_.append_order(
@@ -166,12 +188,19 @@ public:
     [[nodiscard]] CancelResult cancel_order(const OrderId id, const Timestamp timestamp = 0) noexcept
     {
         CancelResult result{};
-        event_log_.begin_operation(1);
+        event_log_.begin_operation(0);
         Order* order = order_ids_.find(id);
         if (order == nullptr) {
             result.status = Status::UnknownOrderId;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             emit_order_rejected(id, Side::Buy, 0, 0, timestamp, TimeInForce::Gtc, result.status);
             return finish_result(result);
+        }
+
+        if (!start_event_operation(1)) {
+            return event_log_full_result(result);
         }
 
         result.canceled_quantity = order->quantity;
@@ -205,9 +234,12 @@ public:
                                             const Timestamp timestamp = 0) noexcept
     {
         ModifyResult result{};
-        event_log_.begin_operation(1);
+        event_log_.begin_operation(0);
         if (new_quantity == 0) {
             result.status = Status::InvalidQuantity;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             emit_order_rejected(id, Side::Buy, 0, new_quantity, timestamp, TimeInForce::Gtc, result.status);
             return finish_result(result);
         }
@@ -215,8 +247,15 @@ public:
         Order* order = order_ids_.find(id);
         if (order == nullptr) {
             result.status = Status::UnknownOrderId;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             emit_order_rejected(id, Side::Buy, 0, new_quantity, timestamp, TimeInForce::Gtc, result.status);
             return finish_result(result);
+        }
+
+        if (!start_event_operation(1)) {
+            return event_log_full_result(result);
         }
 
         result.old_quantity = order->quantity;
@@ -270,6 +309,13 @@ public:
         return finish_result(result);
     }
 
+    /// Replace a resting order.
+    ///
+    /// Same-price reductions keep FIFO priority. Price changes or quantity
+    /// increases cancel and re-enter the order, so the replacement loses time
+    /// priority before matching or resting. IOC/FOK apply only to that
+    /// lose-priority replacement path. `Status::EventLogFull` emits no events
+    /// and leaves book state unchanged.
     [[nodiscard]] ReplaceResult replace_order(const OrderId id,
                                               const Price new_price,
                                               const Quantity new_quantity,
@@ -278,6 +324,7 @@ public:
         return replace_order(id, new_price, new_quantity, 0, time_in_force);
     }
 
+    /// Replace a resting order with an explicit event timestamp.
     [[nodiscard]] ReplaceResult replace_order(const OrderId id,
                                               const Price new_price,
                                               const Quantity new_quantity,
@@ -287,11 +334,14 @@ public:
         ReplaceResult result{};
         result.new_price = new_price;
         result.new_quantity = new_quantity;
-        event_log_.begin_operation(max_events_for_replace());
+        event_log_.begin_operation(0);
 
         Order* order = order_ids_.find(id);
         if (order == nullptr) {
             result.status = Status::UnknownOrderId;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             emit_order_rejected(id, Side::Buy, new_price, new_quantity, timestamp, time_in_force, result.status);
             return finish_result(result);
         }
@@ -305,6 +355,9 @@ public:
         const Status validation_status = validate_replacement_order(new_price, new_quantity);
         if (validation_status != Status::Accepted) {
             result.status = validation_status;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             event_log_.append_order(BookEvent::Kind::OrderRejected,
                                     result.status,
                                     id,
@@ -320,6 +373,9 @@ public:
 
         if (!valid_time_in_force(time_in_force)) {
             result.status = Status::Rejected;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             event_log_.append_order(BookEvent::Kind::OrderRejected,
                                     result.status,
                                     id,
@@ -334,6 +390,10 @@ public:
         }
 
         if (new_price == old_price && new_quantity <= old_quantity) {
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
+
             if (new_quantity == old_quantity) {
                 result.status = Status::Accepted;
                 result.resting_quantity = old_quantity;
@@ -369,10 +429,14 @@ public:
             return finish_result(result);
         }
 
+        BookSide& same_side = side_value == Side::Buy ? bids_ : asks_;
         BookSide& contra_side = side_value == Side::Buy ? asks_ : bids_;
         const Quantity executable = contra_side.executable_quantity(new_quantity, true, new_price);
         if (time_in_force == TimeInForce::Fok && executable < new_quantity) {
             result.status = Status::FokRejected;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             event_log_.append_order(BookEvent::Kind::OrderRejected,
                                     result.status,
                                     id,
@@ -387,22 +451,14 @@ public:
         }
 
         if (time_in_force == TimeInForce::Gtc && executable < new_quantity) {
-            if (orders_.available() == 0U) {
-                result.status = Status::PoolExhausted;
-                event_log_.append_order(BookEvent::Kind::OrderRejected,
-                                        result.status,
-                                        id,
-                                        side_value,
-                                        new_price,
-                                        new_quantity,
-                                        timestamp,
-                                        time_in_force,
-                                        old_quantity,
-                                        new_quantity);
-                return finish_result(result);
-            }
-            if (order_ids_.full()) {
-                result.status = Status::OrderIdMapFull;
+            const Quantity residual_quantity = new_quantity - executable;
+            const Status storage_status =
+                same_side.can_accept_replacement_residual(*order, new_price, residual_quantity);
+            if (storage_status != Status::Accepted) {
+                result.status = storage_status;
+                if (!start_event_operation(1)) {
+                    return event_log_full_result(result);
+                }
                 event_log_.append_order(BookEvent::Kind::OrderRejected,
                                         result.status,
                                         id,
@@ -417,7 +473,12 @@ public:
             }
         }
 
-        BookSide& same_side = side_value == Side::Buy ? bids_ : asks_;
+        const std::uint32_t required_event_count =
+            required_replace_event_count(contra_side, new_quantity, executable, true, new_price);
+        if (!start_event_operation(required_event_count)) {
+            return event_log_full_result(result);
+        }
+
         const Status remove_status = same_side.remove_order(*order);
         if (remove_status != Status::Accepted) {
             result.status = remove_status;
@@ -526,15 +587,27 @@ public:
                                                  const OrderId aggressor_id = kInvalidOrderId,
                                                  const Timestamp timestamp = 0) noexcept
     {
-        event_log_.begin_operation(max_events_for_market());
+        event_log_.begin_operation(0);
         if (quantity == 0) {
             MatchResult result{};
             result.status = Status::InvalidQuantity;
+            if (!start_event_operation(1)) {
+                return event_log_full_result(result);
+            }
             emit_order_rejected(aggressor_id, aggressor_side, 0, quantity, timestamp, TimeInForce::Gtc, result.status);
             return finish_result(result);
         }
 
         BookSide& contra_side = aggressor_side == Side::Buy ? asks_ : bids_;
+        const std::uint32_t required_event_count = contra_side.executable_fill_count(quantity, false, 0);
+        if (!start_event_operation(required_event_count)) {
+            MatchResult result{};
+            result.status = Status::EventLogFull;
+            result.requested_quantity = quantity;
+            result.remaining_quantity = quantity;
+            return finish_result(result);
+        }
+
         MatchResult result =
             contra_side.match(quantity, false, 0, order_ids_, orders_, event_log_, aggressor_id, aggressor_side, timestamp);
         return finish_result(result);
@@ -635,9 +708,8 @@ private:
         if (normalized.order_id_map_capacity == 0 && normalized.max_orders != 0) {
             normalized.order_id_map_capacity = saturated_double(normalized.max_orders);
         }
-        const std::uint32_t minimum_event_capacity = minimum_event_log_capacity(normalized.max_orders);
-        if (normalized.event_log_capacity < minimum_event_capacity) {
-            normalized.event_log_capacity = minimum_event_capacity;
+        if (normalized.event_log_capacity == 0) {
+            normalized.event_log_capacity = minimum_event_log_capacity(normalized.max_orders);
         }
         return normalized;
     }
@@ -738,6 +810,62 @@ private:
     [[nodiscard]] std::uint32_t max_events_for_market() const noexcept
     {
         return std::max(1U, orders_.size());
+    }
+
+    [[nodiscard]] bool start_event_operation(const std::uint32_t required_event_count) noexcept
+    {
+        if (!event_log_.can_record(required_event_count)) {
+            event_log_.begin_operation(0);
+            return false;
+        }
+
+        event_log_.begin_operation(required_event_count);
+        return true;
+    }
+
+    template <typename Result>
+    [[nodiscard]] Result event_log_full_result(Result result) noexcept
+    {
+        result.status = Status::EventLogFull;
+        return finish_result(result);
+    }
+
+    [[nodiscard]] static std::uint32_t saturated_add(const std::uint32_t lhs,
+                                                     const std::uint32_t rhs) noexcept
+    {
+        return rhs > std::numeric_limits<std::uint32_t>::max() - lhs
+                   ? std::numeric_limits<std::uint32_t>::max()
+                   : lhs + rhs;
+    }
+
+    [[nodiscard]] static std::uint32_t residual_event_count(const Quantity requested_quantity,
+                                                            const Quantity executable_quantity) noexcept
+    {
+        return executable_quantity < requested_quantity ? 1U : 0U;
+    }
+
+    [[nodiscard]] static std::uint32_t required_limit_event_count(const BookSide& contra_side,
+                                                                  const Quantity requested_quantity,
+                                                                  const Quantity executable_quantity,
+                                                                  const bool has_limit_price,
+                                                                  const Price limit_price) noexcept
+    {
+        std::uint32_t required = 1U;
+        required = saturated_add(
+            required, contra_side.executable_fill_count(requested_quantity, has_limit_price, limit_price));
+        return saturated_add(required, residual_event_count(requested_quantity, executable_quantity));
+    }
+
+    [[nodiscard]] static std::uint32_t required_replace_event_count(const BookSide& contra_side,
+                                                                    const Quantity requested_quantity,
+                                                                    const Quantity executable_quantity,
+                                                                    const bool has_limit_price,
+                                                                    const Price limit_price) noexcept
+    {
+        std::uint32_t required = 2U;
+        required = saturated_add(
+            required, contra_side.executable_fill_count(requested_quantity, has_limit_price, limit_price));
+        return saturated_add(required, residual_event_count(requested_quantity, executable_quantity));
     }
 
     void emit_order_rejected(const OrderId id,
