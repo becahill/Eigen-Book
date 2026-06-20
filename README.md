@@ -1,5 +1,5 @@
 # Eigen-Book
-
+[![CI](https://github.com/becahill/Eigen-Book/actions/workflows/ci.yml/badge.svg)](https://github.com/becahill/Eigen-Book/actions/workflows/ci.yml)
 Eigen-Book is a C++20 low-latency limit order book and matching engine. The
 core is fixed-capacity, header-only, dependency-free, and designed around
 deterministic behavior after construction.
