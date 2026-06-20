@@ -13,6 +13,7 @@ option(EIGENBOOK_BUILD_TESTS "Build Eigen-Book unit tests" ON)
 option(EIGENBOOK_BUILD_BENCHMARKS "Build Eigen-Book benchmark executable" ON)
 option(EIGENBOOK_BUILD_EXAMPLES "Build Eigen-Book usage examples" ON)
 option(EIGENBOOK_BUILD_FUZZERS "Build Clang libFuzzer harnesses" OFF)
+option(EIGENBOOK_BUILD_PYTHON "Build the eigenbook_py Python extension" OFF)
 option(EIGENBOOK_ENABLE_ASAN "Enable AddressSanitizer on supported compilers" OFF)
 option(EIGENBOOK_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer on supported compilers" OFF)
 
@@ -57,6 +58,38 @@ elseif(EIGENBOOK_ENABLE_ASAN OR EIGENBOOK_ENABLE_UBSAN)
 endif()
 
 include(CTest)
+
+if(EIGENBOOK_BUILD_PYTHON)
+    include(FetchContent)
+
+    find_package(Python 3.8 COMPONENTS Interpreter Development.Module NumPy REQUIRED)
+    set(PYBIND11_FINDPYTHON ON)
+    FetchContent_Declare(
+        pybind11
+        GIT_REPOSITORY https://github.com/pybind/pybind11.git
+        GIT_TAG v3.0.4
+        GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(pybind11)
+
+    pybind11_add_module(eigenbook_py MODULE
+        src/bindings.cpp)
+    target_link_libraries(eigenbook_py PRIVATE EigenBook::eigenbook)
+
+    if(EIGENBOOK_BUILD_TESTS AND BUILD_TESTING)
+        add_test(
+            NAME eigenbook_python_bindings
+            COMMAND ${CMAKE_COMMAND} -E env
+                "PYTHONPATH=$<TARGET_FILE_DIR:eigenbook_py>"
+                ${Python_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_python_bindings.py")
+        add_test(
+            NAME eigenbook_numpy_event_buffer
+            COMMAND ${CMAKE_COMMAND} -E env
+                "PYTHONPATH=$<TARGET_FILE_DIR:eigenbook_py>"
+                ${Python_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_numpy_event_buffer.py")
+    endif()
+endif()
 
 if(EIGENBOOK_BUILD_TESTS)
     if(BUILD_TESTING)
