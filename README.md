@@ -294,12 +294,44 @@ fuzzer. The bounded CI-equivalent smoke runs are registered with CTest:
 ctest --test-dir build-fuzz --output-on-failure -L fuzz
 ```
 
+## Python Bindings
+
+The optional `eigenbook_py` module exposes `BookConfig`, `InstrumentConfig`,
+`Command`, `MatchingEngine::dispatch`, `MatchingEngine::dispatch_with_buffer`,
+and `MatchingEngine::top_of_book`. Pybind11 is fetched only when the module is
+enabled; NumPy must be installed for its interpreter:
+
+```sh
+cmake -S . -B build-python \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DEIGENBOOK_BUILD_PYTHON=ON
+cmake --build build-python --target eigenbook_py
+PYTHONPATH=build-python python3 tests/test_python_bindings.py
+```
+
+The Python configuration sequence is copied into exact-size temporary storage
+during engine construction. `dispatch_with_buffer(command, event_buffer)`
+copies raw, trivially-copyable `BookEvent` records into a writable,
+C-contiguous, one-dimensional NumPy array with `BOOK_EVENT_DTYPE` and returns
+the number written. Allocate the array once with at least the instrument's
+configured event-log capacity and reuse it:
+
+```python
+events = np.empty(event_log_capacity, dtype=eigenbook_py.BOOK_EVENT_DTYPE)
+event_count = engine.dispatch_with_buffer(command, events)
+```
+
+The dtype is passed with implicit conversion disabled. The successful C++ call
+uses the caller's existing memory directly and adds no dynamic C++ container or
+per-event Python object to the matching path.
+
 ## Build Options
 
 - `EIGENBOOK_BUILD_TESTS=ON`: build `eigenbook_tests`
 - `EIGENBOOK_BUILD_BENCHMARKS=ON`: build `eigenbook_bench`
 - `EIGENBOOK_BUILD_EXAMPLES=ON`: build `eigenbook_basic_usage`
 - `EIGENBOOK_BUILD_FUZZERS=ON`: optionally build Clang libFuzzer + ASAN + UBSAN harnesses (default `OFF`)
+- `EIGENBOOK_BUILD_PYTHON=ON`: fetch pybind11 and build `eigenbook_py` (default `OFF`)
 - `EIGENBOOK_ENABLE_ASAN=OFF`: toggle AddressSanitizer
 - `EIGENBOOK_ENABLE_UBSAN=OFF`: toggle UndefinedBehaviorSanitizer
 
