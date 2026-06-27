@@ -1,3 +1,4 @@
+#include "BenchmarkBuildInfo.hpp"
 #include "Command.hpp"
 #include "MatchingEngine.hpp"
 #include "OrderBook.hpp"
@@ -5,13 +6,25 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
+#include <ctime>
+#include <limits>
 #include <span>
 #include <vector>
+
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/utsname.h>
+#endif
 
 namespace {
 
@@ -19,6 +32,25 @@ using namespace eigenbook;
 using Clock = std::chrono::steady_clock;
 
 constexpr std::uint32_t kSampleBlockSize = 64;
+constexpr std::uint32_t kDefaultOperations = 50'000;
+constexpr std::uint32_t kDefaultIterations = 1;
+constexpr std::uint32_t kMaximumOperations = 1'000'000;
+constexpr std::uint32_t kSnapshotLiveOrders = 256;
+constexpr std::uint32_t kSnapshotRestoreCapacity = 4'096;
+constexpr std::uint32_t kSnapshotRestorePriceLevels = kSnapshotRestoreCapacity * 2U;
+constexpr std::array<std::uint32_t, 4> kSnapshotRestoreSizes{64, 256, 1'024, 4'096};
+constexpr std::array<const char*, 4> kSnapshotRestoreNames{
+    "Restore snapshot (64 orders)",
+    "Restore snapshot (256 orders)",
+    "Restore snapshot (1024 orders)",
+    "Restore snapshot (4096 orders)",
+};
+constexpr std::uint32_t kWidePriceCount = 20;
+
+struct BenchmarkOptions final {
+    std::uint32_t operations{kDefaultOperations};
+    std::uint32_t iterations{kDefaultIterations};
+};
 
 struct BenchmarkResult final {
     const char* name{nullptr};
@@ -30,6 +62,164 @@ struct BenchmarkResult final {
     std::uint64_t p95_ns{0};
     std::uint64_t p99_ns{0};
 };
+
+[[nodiscard]] bool parse_positive_u32(const char* const text, std::uint32_t& value) noexcept
+{
+    if (text == nullptr || text[0] == '\0' || text[0] == '-') {
+        return false;
+    }
+
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || parsed == 0 ||
+        parsed > std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+    }
+
+    value = static_cast<std::uint32_t>(parsed);
+    return true;
+}
+
+[[nodiscard]] bool parse_options(const int argc,
+                                 char* const argv[],
+                                 BenchmarkOptions& options) noexcept
+{
+    for (int index = 1; index < argc; ++index) {
+        if (std::strcmp(argv[index], "--operations") == 0) {
+            if (index + 1 >= argc || !parse_positive_u32(argv[index + 1], options.operations)) {
+                return false;
+            }
+            ++index;
+            continue;
+        }
+
+        if (std::strcmp(argv[index], "--iterations") == 0) {
+            if (index + 1 >= argc || !parse_positive_u32(argv[index + 1], options.iterations)) {
+                return false;
+            }
+            ++index;
+            continue;
+        }
+
+        return false;
+    }
+
+    return options.operations <= kMaximumOperations && options.operations % 20U == 0U &&
+           options.iterations <= 100U;
+}
+
+void print_usage(const char* const program)
+{
+    std::fprintf(stderr,
+                 "Usage: %s [--operations N] [--iterations N]\n"
+                 "  operations must be a multiple of 20 in [20, %u]\n"
+                 "  iterations must be in [1, 100]\n",
+                 program,
+                 kMaximumOperations);
+}
+
+void read_utc_timestamp(char* const output, const std::size_t capacity) noexcept
+{
+    const std::time_t now = std::time(nullptr);
+    std::tm utc{};
+#if defined(_WIN32)
+    if (gmtime_s(&utc, &now) != 0) {
+        std::snprintf(output, capacity, "unavailable");
+        return;
+    }
+#else
+    if (gmtime_r(&now, &utc) == nullptr) {
+        std::snprintf(output, capacity, "unavailable");
+        return;
+    }
+#endif
+    if (std::strftime(output, capacity, "%Y-%m-%dT%H:%M:%SZ", &utc) == 0) {
+        std::snprintf(output, capacity, "unavailable");
+    }
+}
+
+void read_cpu_model(char* const output, const std::size_t capacity) noexcept
+{
+    std::snprintf(output, capacity, "unavailable");
+#if defined(__APPLE__)
+    std::size_t size = capacity;
+    if (sysctlbyname("machdep.cpu.brand_string", output, &size, nullptr, 0) != 0) {
+        std::snprintf(output, capacity, "unavailable");
+    }
+#elif defined(__linux__)
+    std::FILE* const cpuinfo = std::fopen("/proc/cpuinfo", "r");
+    if (cpuinfo == nullptr) {
+        return;
+    }
+
+    char line[512]{};
+    while (std::fgets(line, static_cast<int>(sizeof(line)), cpuinfo) != nullptr) {
+        if (std::strncmp(line, "model name", 10) != 0 && std::strncmp(line, "Hardware", 8) != 0) {
+            continue;
+        }
+
+        const char* value = std::strchr(line, ':');
+        if (value == nullptr) {
+            continue;
+        }
+        ++value;
+        while (*value == ' ' || *value == '\t') {
+            ++value;
+        }
+        const std::size_t length = std::strcspn(value, "\r\n");
+        std::snprintf(output, capacity, "%.*s", static_cast<int>(length), value);
+        break;
+    }
+    std::fclose(cpuinfo);
+#endif
+}
+
+void print_run_context(const BenchmarkOptions& options)
+{
+    char timestamp[32]{};
+    char cpu_model[256]{};
+    read_utc_timestamp(timestamp, sizeof(timestamp));
+    read_cpu_model(cpu_model, sizeof(cpu_model));
+
+    std::printf("Eigen-Book benchmark run context\n");
+    std::printf("Timestamp (UTC): %s\n", timestamp);
+    std::printf("CPU: %s\n", cpu_model);
+#if defined(__unix__) || defined(__APPLE__)
+    utsname system{};
+    if (uname(&system) == 0) {
+        std::printf("OS: %s %s (%s)\n", system.sysname, system.release, system.machine);
+    } else {
+        std::printf("OS: unavailable\n");
+    }
+#else
+    std::printf("OS: unavailable\n");
+#endif
+    std::printf("Compiler: %s %s\n",
+                benchmark_build::kCompilerId,
+                benchmark_build::kCompilerVersion);
+#if defined(__clang__)
+    std::printf("Compiler build: %s\n", __clang_version__);
+#elif defined(__GNUC__)
+    std::printf("Compiler build: %s\n", __VERSION__);
+#elif defined(_MSC_VER)
+    std::printf("Compiler build: MSVC %d\n", _MSC_VER);
+#endif
+    std::printf("Compiler path: %s\n", benchmark_build::kCompilerPath);
+    std::printf("Build type: %s\n", benchmark_build::kBuildType);
+    std::printf("Optimization flags: %s\n", benchmark_build::kOptimizationFlags);
+    std::printf("CMake: %s (%s)\n",
+                benchmark_build::kCMakeVersion,
+                benchmark_build::kCMakeGenerator);
+    std::printf("Workload iterations: %u\n", options.iterations);
+    std::printf("Operations per workload iteration: %u operations\n", options.operations);
+    std::printf("Latency sampling: %u-operation blocks\n", kSampleBlockSize);
+    std::printf("Wide-price workload: %u occupied prices over [1, 1000000]\n", kWidePriceCount);
+    std::printf("Snapshot serialize workload: %u live orders\n", kSnapshotLiveOrders);
+    std::printf("Snapshot restore workloads: 64, 256, 1024, and 4096 live orders; one occupied level per order\n");
+    std::printf("Snapshot restore configuration: dense [1, 8192], 4096 order slots, 8192 id-map slots\n");
+    std::printf("Units: total=milliseconds, throughput=operations/second, latency=nanoseconds/operation\n\n");
+}
 
 [[nodiscard]] BookConfig make_config(const std::uint32_t max_orders) noexcept
 {
@@ -106,10 +296,58 @@ template <typename Fn>
     });
 }
 
+[[nodiscard]] BenchmarkResult benchmark_add_with_venue_checks(const std::uint32_t operations)
+{
+    BookConfig config = make_config(operations + 16U);
+    config.lot_size = 10;
+    config.self_trade_policy = SelfTradePolicy::CancelResting;
+    OrderBook book(config);
+    std::vector<OrderId> ids(operations);
+    std::vector<Price> prices(operations);
+    for (std::uint32_t i = 0; i < operations; ++i) {
+        ids[i] = static_cast<OrderId>(i + 1U);
+        prices[i] = 100 + static_cast<Price>(i % 50U);
+    }
+
+    return run_benchmark("Add with venue checks", operations, [&](const std::uint32_t i) {
+        const AddOrderResult result = book.add_limit_order(ids[i],
+                                                           Side::Buy,
+                                                           prices[i],
+                                                           100,
+                                                           i,
+                                                           TimeInForce::Gtc,
+                                                           static_cast<ParticipantId>(i + 1U));
+        if (result.status != Status::Accepted) {
+            std::abort();
+        }
+    });
+}
+
+[[nodiscard]] BenchmarkResult benchmark_add_with_market_data(const std::uint32_t operations)
+{
+    BookConfig config = make_config(operations + 16U);
+    config.market_data_capacity = 4;
+    OrderBook book(config, 1U);
+    std::vector<OrderId> ids(operations);
+    std::vector<Price> prices(operations);
+    for (std::uint32_t i = 0; i < operations; ++i) {
+        ids[i] = static_cast<OrderId>(i + 1U);
+        prices[i] = 100 + static_cast<Price>(i % 50U);
+    }
+
+    return run_benchmark("Add with market data", operations, [&](const std::uint32_t i) {
+        const AddOrderResult result =
+            book.add_limit_order(ids[i], Side::Buy, prices[i], 100, i);
+        if (result.status != Status::Accepted || book.last_market_data_events().empty()) {
+            std::abort();
+        }
+    });
+}
+
 [[nodiscard]] BenchmarkResult benchmark_dense_wide_sparse_prices(const std::uint32_t operations)
 {
     OrderBook book(make_wide_config(operations + 16U, PriceLevelMode::Dense));
-    constexpr std::array<Price, 20> prices{
+    constexpr std::array<Price, kWidePriceCount> prices{
         10,
         50'000,
         100'000,
@@ -144,7 +382,7 @@ template <typename Fn>
 [[nodiscard]] BenchmarkResult benchmark_sparse_wide_sparse_prices(const std::uint32_t operations)
 {
     OrderBook book(make_wide_config(operations + 16U, PriceLevelMode::Sparse));
-    constexpr std::array<Price, 20> prices{
+    constexpr std::array<Price, kWidePriceCount> prices{
         10,
         50'000,
         100'000,
@@ -532,11 +770,10 @@ struct Event final {
 
 [[nodiscard]] BenchmarkResult benchmark_snapshot_serialize(const std::uint32_t operations)
 {
-    constexpr std::uint32_t live_orders = 256;
-    OrderBook book(make_config(live_orders + 16U));
+    OrderBook book(make_config(kSnapshotLiveOrders + 16U));
     std::vector<std::byte> buffer(64U * 1024U);
 
-    for (std::uint32_t i = 0; i < live_orders; ++i) {
+    for (std::uint32_t i = 0; i < kSnapshotLiveOrders; ++i) {
         const Side side = i % 2U == 0U ? Side::Buy : Side::Sell;
         const Price price = side == Side::Buy ? 100 + static_cast<Price>(i % 20U)
                                               : 200 + static_cast<Price>(i % 20U);
@@ -554,18 +791,42 @@ struct Event final {
     });
 }
 
-[[nodiscard]] BenchmarkResult benchmark_snapshot_restore(const std::uint32_t operations)
+[[nodiscard]] std::uint32_t snapshot_restore_operations(const std::uint32_t operations,
+                                                        const std::uint32_t order_count) noexcept
 {
-    constexpr std::uint32_t live_orders = 256;
-    const BookConfig config = make_config(live_orders + 16U);
+    constexpr std::uint64_t reference_orders = 256;
+    constexpr std::uint64_t minimum_operations = 10;
+    const std::uint64_t reference_operations = std::max<std::uint64_t>(1U, operations / 10U);
+    const std::uint64_t scaled =
+        (reference_operations * reference_orders * reference_orders) /
+        (static_cast<std::uint64_t>(order_count) * static_cast<std::uint64_t>(order_count));
+    return static_cast<std::uint32_t>(std::max(minimum_operations, scaled));
+}
+
+[[nodiscard]] BenchmarkResult benchmark_snapshot_restore(const char* const name,
+                                                         const std::uint32_t operations,
+                                                         const std::uint32_t order_count)
+{
+    const BookConfig config{
+        1,
+        static_cast<Price>(kSnapshotRestorePriceLevels),
+        kSnapshotRestoreCapacity,
+        kSnapshotRestoreCapacity * 2U,
+    };
     OrderBook source(config);
     OrderBook target(config);
-    std::vector<std::byte> buffer(64U * 1024U);
+    std::vector<std::byte> buffer(
+        detail::kBookHeaderWireSize +
+        static_cast<std::size_t>(order_count) *
+            (detail::kBookOrderWireSize + detail::kLevelWireSize));
 
-    for (std::uint32_t i = 0; i < live_orders; ++i) {
-        const Side side = i % 2U == 0U ? Side::Buy : Side::Sell;
-        const Price price = side == Side::Buy ? 100 + static_cast<Price>(i % 20U)
-                                              : 200 + static_cast<Price>(i % 20U);
+    const std::uint32_t bid_count = order_count / 2U;
+    for (std::uint32_t i = 0; i < order_count; ++i) {
+        const Side side = i < bid_count ? Side::Buy : Side::Sell;
+        const Price price =
+            side == Side::Buy
+                ? static_cast<Price>(i + 1U)
+                : static_cast<Price>(kSnapshotRestoreCapacity + (i - bid_count) + 1U);
         const AddOrderResult result = source.add_limit_order(static_cast<OrderId>(i + 1U), side, price, 100);
         if (result.status != Status::Accepted) {
             std::abort();
@@ -577,7 +838,7 @@ struct Event final {
         std::abort();
     }
 
-    return run_benchmark("Restore book snapshot", operations, [&](const std::uint32_t) {
+    return run_benchmark(name, operations, [&](const std::uint32_t) {
         const Status status = restore(target, std::span<const std::byte>(buffer.data(), snapshot.bytes_written));
         if (status != Status::Accepted) {
             std::abort();
@@ -600,41 +861,65 @@ void print_result(const BenchmarkResult& result)
 
 } // namespace
 
-int main()
+int main(const int argc, char* const argv[])
 {
-    constexpr std::uint32_t operations = 50'000;
+    BenchmarkOptions options{};
+    if (!parse_options(argc, argv, options)) {
+        print_usage(argv[0]);
+        return 2;
+    }
 
-    const BenchmarkResult add = benchmark_add_orders(operations);
-    const BenchmarkResult dense_wide = benchmark_dense_wide_sparse_prices(operations);
-    const BenchmarkResult sparse_wide = benchmark_sparse_wide_sparse_prices(operations);
-    const BenchmarkResult cancel = benchmark_cancel_orders(operations);
-    const BenchmarkResult modify = benchmark_modify_orders(operations);
-    const BenchmarkResult replace = benchmark_replace_orders(operations);
-    const BenchmarkResult match = benchmark_market_matches(operations);
-    const BenchmarkResult ioc = benchmark_ioc_partial_matches(operations);
-    const BenchmarkResult fok_reject = benchmark_fok_rejects(operations);
-    const BenchmarkResult fok_accept = benchmark_fok_accepts(operations);
-    const BenchmarkResult mixed = benchmark_mixed_workload(operations);
-    const BenchmarkResult replay_dispatch = benchmark_replay_dispatch(operations);
-    const BenchmarkResult snapshot_serialize = benchmark_snapshot_serialize(operations);
-    const BenchmarkResult snapshot_restore = benchmark_snapshot_restore(operations);
+    print_run_context(options);
+    for (std::uint32_t iteration = 0; iteration < options.iterations; ++iteration) {
+        const BenchmarkResult add = benchmark_add_orders(options.operations);
+        const BenchmarkResult venue_checks = benchmark_add_with_venue_checks(options.operations);
+        const BenchmarkResult market_data = benchmark_add_with_market_data(options.operations);
+        const BenchmarkResult dense_wide = benchmark_dense_wide_sparse_prices(options.operations);
+        const BenchmarkResult sparse_wide = benchmark_sparse_wide_sparse_prices(options.operations);
+        const BenchmarkResult cancel = benchmark_cancel_orders(options.operations);
+        const BenchmarkResult modify = benchmark_modify_orders(options.operations);
+        const BenchmarkResult replace = benchmark_replace_orders(options.operations);
+        const BenchmarkResult match = benchmark_market_matches(options.operations);
+        const BenchmarkResult ioc = benchmark_ioc_partial_matches(options.operations);
+        const BenchmarkResult fok_reject = benchmark_fok_rejects(options.operations);
+        const BenchmarkResult fok_accept = benchmark_fok_accepts(options.operations);
+        const BenchmarkResult mixed = benchmark_mixed_workload(options.operations);
+        const BenchmarkResult replay_dispatch = benchmark_replay_dispatch(options.operations);
+        const BenchmarkResult snapshot_serialize = benchmark_snapshot_serialize(options.operations);
+        std::array<BenchmarkResult, kSnapshotRestoreSizes.size()> snapshot_restores{};
+        for (std::size_t index = 0; index < kSnapshotRestoreSizes.size(); ++index) {
+            const std::uint32_t order_count = kSnapshotRestoreSizes[index];
+            snapshot_restores[index] =
+                benchmark_snapshot_restore(kSnapshotRestoreNames[index],
+                                           snapshot_restore_operations(options.operations, order_count),
+                                           order_count);
+        }
 
-    std::printf("Eigen-Book microbenchmarks (%u operations per scenario)\n", operations);
-    std::printf("| Scenario                      | Operations | Total ms   | Ops/sec        | Avg ns   | p50 ns | p95 ns | p99 ns |\n");
-    std::printf("|-------------------------------|------------|------------|----------------|----------|--------|--------|--------|\n");
-    print_result(add);
-    print_result(dense_wide);
-    print_result(sparse_wide);
-    print_result(cancel);
-    print_result(modify);
-    print_result(replace);
-    print_result(match);
-    print_result(ioc);
-    print_result(fok_reject);
-    print_result(fok_accept);
-    print_result(mixed);
-    print_result(replay_dispatch);
-    print_result(snapshot_serialize);
-    print_result(snapshot_restore);
+        std::printf("Eigen-Book microbenchmarks (iteration %u/%u, %u operations per workload)\n",
+                    iteration + 1U,
+                    options.iterations,
+                    options.operations);
+        std::printf("| Scenario                      | Operations | Total ms   | Ops/sec        | Avg ns   | p50 ns | p95 ns | p99 ns |\n");
+        std::printf("|-------------------------------|------------|------------|----------------|----------|--------|--------|--------|\n");
+        print_result(add);
+        print_result(venue_checks);
+        print_result(market_data);
+        print_result(dense_wide);
+        print_result(sparse_wide);
+        print_result(cancel);
+        print_result(modify);
+        print_result(replace);
+        print_result(match);
+        print_result(ioc);
+        print_result(fok_reject);
+        print_result(fok_accept);
+        print_result(mixed);
+        print_result(replay_dispatch);
+        print_result(snapshot_serialize);
+        for (const BenchmarkResult& snapshot_restore : snapshot_restores) {
+            print_result(snapshot_restore);
+        }
+        std::printf("\n");
+    }
     return 0;
 }

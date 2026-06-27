@@ -39,11 +39,110 @@ jobs:
           -DCMAKE_BUILD_TYPE=${{ matrix.build-type }}
           ${{ matrix.cmake-args }}
 
+      - name: Confirm benchmark target builds
+        if: matrix.build-type == 'Release'
+        run: cmake --build "${{ matrix.build-dir }}" --parallel --target eigenbook_bench
+
       - name: Build tests, examples, and benchmarks
         run: cmake --build "${{ matrix.build-dir }}" --parallel
 
+      - name: Run zero-allocation hot-path guard
+        if: matrix.build-type == 'Debug' || matrix.build-type == 'Release'
+        run: >
+          ctest --test-dir "${{ matrix.build-dir }}" --output-on-failure
+          --label-regex '^allocation$'
+
       - name: Run tests
         run: ctest --test-dir "${{ matrix.build-dir }}" --output-on-failure
+
+  python-core:
+    name: Python ${{ matrix.python-version }} core package
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install core package and test runner
+        run: python -m pip install '.[test]'
+
+      - name: Verify Gymnasium is not a core dependency
+        run: >
+          python -c "import importlib.util;
+          assert importlib.util.find_spec('gymnasium') is None"
+
+      - name: Test installed core package
+        working-directory: ${{ runner.temp }}
+        run: >
+          python -m pytest
+          "${{ github.workspace }}/tests/test_python_bindings.py"
+          "${{ github.workspace }}/tests/test_numpy_event_buffer.py"
+          "${{ github.workspace }}/tests/test_packaging.py"
+
+  python-rl:
+    name: Python Gymnasium extra
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install package with RL and test extras
+        run: python -m pip install '.[rl,test]'
+
+      - name: Test installed Gymnasium environment
+        working-directory: ${{ runner.temp }}
+        run: >
+          python -m pytest
+          "${{ github.workspace }}/tests/test_eigenbook_env.py"
+
+  python-wheel:
+    name: Build and install wheel
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Build wheel
+        run: |
+          python -m pip install build
+          python -m build --wheel --outdir wheelhouse
+
+      - name: Install wheel in a clean virtual environment
+        run: |
+          python -m venv "${RUNNER_TEMP}/wheel-venv"
+          wheel=$(find wheelhouse -name '*.whl' -print -quit)
+          "${RUNNER_TEMP}/wheel-venv/bin/python" -m pip install "${wheel}[test]"
+
+      - name: Test wheel outside the source tree
+        working-directory: ${{ runner.temp }}
+        run: |
+          "${RUNNER_TEMP}/wheel-venv/bin/python" -I -c "import eigenbook; print(eigenbook.__version__)"
+          "${RUNNER_TEMP}/wheel-venv/bin/python" -m pytest \
+            "${GITHUB_WORKSPACE}/tests/test_python_bindings.py" \
+            "${GITHUB_WORKSPACE}/tests/test_numpy_event_buffer.py" \
+            "${GITHUB_WORKSPACE}/tests/test_packaging.py"
 
   fuzz-smoke:
     name: Clang fuzz smoke
@@ -73,8 +172,48 @@ jobs:
         run: >
           cmake --build build-ci-fuzz --parallel
           --target eigenbook_command_fuzzer eigenbook_snapshot_fuzzer
+          eigenbook_stateful_fuzzer
 
       - name: Run bounded fuzz smoke tests
         run: >
           ctest --test-dir build-ci-fuzz --output-on-failure
           --tests-regex '^eigenbook_fuzz_.*_smoke$'
+
+      - name: Preserve failing fuzz input
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: eigenbook-fuzz-failure
+          path: build-ci-fuzz/fuzz-artifacts/
+          if-no-files-found: ignore
+
+  static-analysis:
+    name: Clang 18 static analysis
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install Clang analysis tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang-18 clang-tidy-18
+
+      - name: Configure focused clang-tidy checks
+        env:
+          CC: clang-18
+          CXX: clang++-18
+        run: >
+          cmake -S . -B build-ci-analysis
+          -DCMAKE_BUILD_TYPE=Debug
+          -DEIGENBOOK_BUILD_TESTS=OFF
+          -DEIGENBOOK_BUILD_BENCHMARKS=OFF
+          -DEIGENBOOK_BUILD_EXAMPLES=OFF
+          -DEIGENBOOK_ENABLE_CLANG_TIDY=ON
+          -DEIGENBOOK_CLANG_TIDY_EXECUTABLE=clang-tidy-18
+
+      - name: Analyze production headers
+        run: >
+          cmake --build build-ci-analysis --parallel
+          --target eigenbook_static_analysis

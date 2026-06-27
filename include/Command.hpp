@@ -41,6 +41,16 @@ struct Command final {
 static_assert(sizeof(Command) == kCommandWireSize);
 static_assert(alignof(Command) == 1);
 
+/// Venue-aware command used by journal/recovery and the extended dispatcher.
+///
+/// The legacy 39-byte `Command` wire contract remains unchanged. New venue
+/// fields are encoded only by the versioned journal format.
+struct VenueCommand final {
+    Command command{};
+    ParticipantId participant_id{kAnonymousParticipantId};
+    bool post_only{false};
+};
+
 [[nodiscard]] constexpr bool valid_command_op(const CommandOp op) noexcept
 {
     return op == CommandOp::Add || op == CommandOp::Cancel || op == CommandOp::Modify ||
@@ -62,6 +72,18 @@ static_assert(alignof(Command) == 1);
 {
     return valid_command_op(command.op) && valid_command_side(command.side) &&
            valid_command_time_in_force(command.time_in_force);
+}
+
+[[nodiscard]] constexpr bool valid_command(const VenueCommand& command) noexcept
+{
+    if (!valid_command(command.command)) {
+        return false;
+    }
+    if (command.post_only &&
+        command.command.op != CommandOp::Add && command.command.op != CommandOp::Replace) {
+        return false;
+    }
+    return true;
 }
 
 namespace detail {

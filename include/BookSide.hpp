@@ -1,6 +1,7 @@
 #pragma once
 
 #include "EventLog.hpp"
+#include "MarketData.hpp"
 #include "MemoryPool.hpp"
 #include "OrderIdMap.hpp"
 #include "PriceLevel.hpp"
@@ -13,6 +14,37 @@
 #include <variant>
 
 namespace eigenbook {
+
+[[nodiscard]] inline bool same_best_quote(const BestQuote& lhs, const BestQuote& rhs) noexcept
+{
+    return lhs.valid == rhs.valid && (!lhs.valid || (lhs.price == rhs.price && lhs.quantity == rhs.quantity &&
+                                                     lhs.order_count == rhs.order_count));
+}
+
+inline void emit_market_data_level_change(MarketDataLog* const market_data,
+                                          const Side side,
+                                          const Price price,
+                                          const Quantity previous_quantity,
+                                          const Quantity quantity,
+                                          const std::uint32_t order_count,
+                                          const BestQuote& previous_best,
+                                          const BestQuote& best,
+                                          const Timestamp timestamp) noexcept
+{
+    if (market_data == nullptr || !market_data->enabled()) {
+        return;
+    }
+
+    const MarketDataEvent::Kind kind =
+        previous_quantity == 0
+            ? MarketDataEvent::Kind::LevelCreated
+            : (quantity == 0 ? MarketDataEvent::Kind::LevelDeleted
+                             : MarketDataEvent::Kind::LevelQuantityChanged);
+    market_data->append_level(kind, side, price, previous_quantity, quantity, order_count, timestamp);
+    if (!same_best_quote(previous_best, best)) {
+        market_data->append_best(side, best, timestamp);
+    }
+}
 
 class alignas(64) DenseBookSide final {
 public:
@@ -212,6 +244,55 @@ public:
         return fills;
     }
 
+    [[nodiscard]] MatchPreflight preflight(const Quantity requested_quantity,
+                                           const bool has_limit_price,
+                                           const Price limit_price,
+                                           const ParticipantId aggressor_participant,
+                                           const SelfTradePolicy policy) const noexcept
+    {
+        MatchPreflight result{};
+        Quantity remaining = requested_quantity;
+        std::uint32_t index = best_index_;
+        while (remaining > 0 && index != kInvalidIndex) {
+            const PriceLevel& level = levels_[index];
+            if (has_limit_price && !crosses(level.price(), limit_price)) {
+                break;
+            }
+
+            const Order* order = level.front();
+            while (remaining > 0 && order != nullptr) {
+                const bool self_trade = policy != SelfTradePolicy::Disabled &&
+                                        aggressor_participant != kAnonymousParticipantId &&
+                                        order->participant_id == aggressor_participant;
+                if (self_trade) {
+                    if (policy == SelfTradePolicy::CancelResting) {
+                        if (result.resting_cancel_count != std::numeric_limits<std::uint32_t>::max()) {
+                            ++result.resting_cancel_count;
+                        }
+                        order = order->next;
+                        continue;
+                    }
+                    if (policy == SelfTradePolicy::CancelBoth &&
+                        result.resting_cancel_count != std::numeric_limits<std::uint32_t>::max()) {
+                        ++result.resting_cancel_count;
+                    }
+                    result.aggressor_cancelled = true;
+                    return result;
+                }
+
+                const Quantity executed = std::min(remaining, order->quantity);
+                remaining -= executed;
+                result.executable_quantity += executed;
+                if (result.fill_count != std::numeric_limits<std::uint32_t>::max()) {
+                    ++result.fill_count;
+                }
+                order = order->next;
+            }
+            index = find_next_index_after(index);
+        }
+        return result;
+    }
+
     [[nodiscard]] MatchResult match(const Quantity requested_quantity,
                                     const bool has_limit_price,
                                     const Price limit_price,
@@ -220,14 +301,31 @@ public:
                                     EventLog& event_log,
                                     const OrderId aggressor_id,
                                     const Side aggressor_side,
-                                    const Timestamp timestamp) noexcept
+                                    const Timestamp timestamp,
+                                    const ParticipantId aggressor_participant = kAnonymousParticipantId,
+                                    const SelfTradePolicy policy = SelfTradePolicy::Disabled,
+                                    MarketDataLog* const market_data = nullptr) noexcept
     {
+        if (policy == SelfTradePolicy::Disabled && market_data == nullptr) {
+            return match_without_venue(requested_quantity,
+                                       has_limit_price,
+                                       limit_price,
+                                       order_ids,
+                                       order_pool,
+                                       event_log,
+                                       aggressor_id,
+                                       aggressor_side,
+                                       timestamp);
+        }
+
         MatchResult result{};
         result.requested_quantity = requested_quantity;
         result.remaining_quantity = requested_quantity;
+        bool stop_matching = false;
 
-        while (result.remaining_quantity > 0 && best_index_ != kInvalidIndex) {
-            PriceLevel& level = levels_[best_index_];
+        while (!stop_matching && result.remaining_quantity > 0 && best_index_ != kInvalidIndex) {
+            const std::uint32_t index = best_index_;
+            PriceLevel& level = levels_[index];
             if (has_limit_price && !crosses(level.price(), limit_price)) {
                 break;
             }
@@ -235,6 +333,80 @@ public:
             while (result.remaining_quantity > 0 && !level.empty()) {
                 Order* resting_order = level.front();
                 const OrderId resting_id = resting_order->id;
+                const ParticipantId resting_participant = resting_order->participant_id;
+                const bool self_trade = policy != SelfTradePolicy::Disabled &&
+                                        aggressor_participant != kAnonymousParticipantId &&
+                                        resting_participant == aggressor_participant;
+                if (self_trade) {
+                    if (policy == SelfTradePolicy::CancelAggressor) {
+                        result.aggressor_cancelled_by_stp = true;
+                        stop_matching = true;
+                        break;
+                    }
+
+                    const Price resting_price = level.price();
+                    Quantity previous_level_quantity = 0;
+                    BestQuote previous_best{};
+                    if (market_data != nullptr) {
+                        previous_level_quantity = level.total_quantity();
+                        previous_best = best_quote();
+                    }
+                    const Quantity canceled_quantity = resting_order->quantity;
+                    if (!level.remove(*resting_order)) {
+                        result.status = Status::InternalError;
+                        return result;
+                    }
+                    static_cast<void>(order_ids.erase(resting_id));
+                    resting_order->clear();
+                    order_pool.release(resting_order);
+                    if (result.resting_orders_cancelled_by_stp != std::numeric_limits<std::uint32_t>::max()) {
+                        ++result.resting_orders_cancelled_by_stp;
+                    }
+                    event_log.append_order(BookEvent::Kind::OrderCancelled,
+                                           Status::SelfTradePrevented,
+                                           resting_id,
+                                           side_,
+                                           resting_price,
+                                           canceled_quantity,
+                                           timestamp);
+
+                    const bool level_empty = level.empty();
+                    const Quantity new_level_quantity =
+                        market_data == nullptr ? 0 : level.total_quantity();
+                    const std::uint32_t new_order_count =
+                        market_data == nullptr ? 0 : level.order_count();
+                    if (level_empty) {
+                        clear_occupied(index);
+                    }
+                    if (market_data != nullptr) {
+                        emit_market_data_level_change(market_data,
+                                                      side_,
+                                                      resting_price,
+                                                      previous_level_quantity,
+                                                      new_level_quantity,
+                                                      new_order_count,
+                                                      previous_best,
+                                                      best_quote(),
+                                                      timestamp);
+                    }
+                    if (policy == SelfTradePolicy::CancelBoth) {
+                        result.aggressor_cancelled_by_stp = true;
+                        stop_matching = true;
+                        break;
+                    }
+                    if (level_empty) {
+                        break;
+                    }
+                    continue;
+                }
+
+                const Price resting_price = level.price();
+                Quantity previous_level_quantity = 0;
+                BestQuote previous_best{};
+                if (market_data != nullptr) {
+                    previous_level_quantity = level.total_quantity();
+                    previous_best = best_quote();
+                }
                 const Quantity executed_quantity = level.fill_front(result.remaining_quantity);
                 if (executed_quantity == 0) {
                     result.status = Status::InternalError;
@@ -245,9 +417,13 @@ public:
                 result.executed_quantity += executed_quantity;
                 ++result.fills;
                 result.has_last_price = true;
-                result.last_price = level.price();
+                result.last_price = resting_price;
                 event_log.append_trade(
-                    aggressor_id, resting_id, aggressor_side, level.price(), executed_quantity, timestamp);
+                    aggressor_id, resting_id, aggressor_side, resting_price, executed_quantity, timestamp);
+                if (market_data != nullptr) {
+                    market_data->append_trade(
+                        aggressor_side, resting_price, executed_quantity, aggressor_id, resting_id, timestamp);
+                }
 
                 if (resting_order->quantity == 0) {
                     if (!level.remove(*resting_order)) {
@@ -258,14 +434,35 @@ public:
                     resting_order->clear();
                     order_pool.release(resting_order);
                 }
-            }
 
-            if (level.empty()) {
-                clear_occupied(best_index_);
+                const bool level_empty = level.empty();
+                const Quantity new_level_quantity =
+                    market_data == nullptr ? 0 : level.total_quantity();
+                const std::uint32_t new_order_count =
+                    market_data == nullptr ? 0 : level.order_count();
+                if (level_empty) {
+                    clear_occupied(index);
+                }
+                if (market_data != nullptr) {
+                    emit_market_data_level_change(market_data,
+                                                  side_,
+                                                  resting_price,
+                                                  previous_level_quantity,
+                                                  new_level_quantity,
+                                                  new_order_count,
+                                                  previous_best,
+                                                  best_quote(),
+                                                  timestamp);
+                }
+                if (level_empty) {
+                    break;
+                }
             }
         }
 
-        if (result.executed_quantity == 0) {
+        if (result.aggressor_cancelled_by_stp && result.executed_quantity == 0) {
+            result.status = Status::SelfTradePrevented;
+        } else if (result.executed_quantity == 0) {
             result.status = Status::NoLiquidity;
         } else if (result.remaining_quantity == 0) {
             result.status = Status::Filled;
@@ -381,6 +578,60 @@ private:
     std::uint32_t occupancy_word_count_{0};
     std::unique_ptr<std::uint64_t[]> occupancy_;
     std::uint32_t best_index_{kInvalidIndex};
+
+    [[nodiscard]] MatchResult match_without_venue(const Quantity requested_quantity,
+                                                  const bool has_limit_price,
+                                                  const Price limit_price,
+                                                  OrderIdMap& order_ids,
+                                                  MemoryPool<Order>& order_pool,
+                                                  EventLog& event_log,
+                                                  const OrderId aggressor_id,
+                                                  const Side aggressor_side,
+                                                  const Timestamp timestamp) noexcept
+    {
+        MatchResult result{};
+        result.requested_quantity = requested_quantity;
+        result.remaining_quantity = requested_quantity;
+        while (result.remaining_quantity > 0 && best_index_ != kInvalidIndex) {
+            PriceLevel& level = levels_[best_index_];
+            if (has_limit_price && !crosses(level.price(), limit_price)) {
+                break;
+            }
+            while (result.remaining_quantity > 0 && !level.empty()) {
+                Order* const resting_order = level.front();
+                const OrderId resting_id = resting_order->id;
+                const Quantity executed = level.fill_front(result.remaining_quantity);
+                if (executed == 0) {
+                    result.status = Status::InternalError;
+                    return result;
+                }
+                result.remaining_quantity -= executed;
+                result.executed_quantity += executed;
+                ++result.fills;
+                result.has_last_price = true;
+                result.last_price = level.price();
+                event_log.append_trade(
+                    aggressor_id, resting_id, aggressor_side, level.price(), executed, timestamp);
+                if (resting_order->quantity == 0) {
+                    if (!level.remove(*resting_order)) {
+                        result.status = Status::InternalError;
+                        return result;
+                    }
+                    static_cast<void>(order_ids.erase(resting_id));
+                    resting_order->clear();
+                    order_pool.release(resting_order);
+                }
+            }
+            if (level.empty()) {
+                clear_occupied(best_index_);
+            }
+        }
+        result.status = result.executed_quantity == 0
+                            ? Status::NoLiquidity
+                            : (result.remaining_quantity == 0 ? Status::Filled
+                                                              : Status::PartiallyFilled);
+        return result;
+    }
 
     [[nodiscard]] std::uint32_t index_for_price(const Price price) const noexcept
     {
@@ -797,6 +1048,55 @@ public:
         return fills;
     }
 
+    [[nodiscard]] MatchPreflight preflight(const Quantity requested_quantity,
+                                           const bool has_limit_price,
+                                           const Price limit_price,
+                                           const ParticipantId aggressor_participant,
+                                           const SelfTradePolicy policy) const noexcept
+    {
+        MatchPreflight result{};
+        Quantity remaining = requested_quantity;
+        std::uint32_t slot = best_slot_;
+        while (remaining > 0 && slot != kInvalidIndex) {
+            const PriceLevel& level = levels_[slot];
+            if (has_limit_price && !crosses(level.price(), limit_price)) {
+                break;
+            }
+
+            const Order* order = level.front();
+            while (remaining > 0 && order != nullptr) {
+                const bool self_trade = policy != SelfTradePolicy::Disabled &&
+                                        aggressor_participant != kAnonymousParticipantId &&
+                                        order->participant_id == aggressor_participant;
+                if (self_trade) {
+                    if (policy == SelfTradePolicy::CancelResting) {
+                        if (result.resting_cancel_count != std::numeric_limits<std::uint32_t>::max()) {
+                            ++result.resting_cancel_count;
+                        }
+                        order = order->next;
+                        continue;
+                    }
+                    if (policy == SelfTradePolicy::CancelBoth &&
+                        result.resting_cancel_count != std::numeric_limits<std::uint32_t>::max()) {
+                        ++result.resting_cancel_count;
+                    }
+                    result.aggressor_cancelled = true;
+                    return result;
+                }
+
+                const Quantity executed = std::min(remaining, order->quantity);
+                remaining -= executed;
+                result.executable_quantity += executed;
+                if (result.fill_count != std::numeric_limits<std::uint32_t>::max()) {
+                    ++result.fill_count;
+                }
+                order = order->next;
+            }
+            slot = find_next_slot_after(slot);
+        }
+        return result;
+    }
+
     [[nodiscard]] MatchResult match(const Quantity requested_quantity,
                                     const bool has_limit_price,
                                     const Price limit_price,
@@ -805,13 +1105,29 @@ public:
                                     EventLog& event_log,
                                     const OrderId aggressor_id,
                                     const Side aggressor_side,
-                                    const Timestamp timestamp) noexcept
+                                    const Timestamp timestamp,
+                                    const ParticipantId aggressor_participant = kAnonymousParticipantId,
+                                    const SelfTradePolicy policy = SelfTradePolicy::Disabled,
+                                    MarketDataLog* const market_data = nullptr) noexcept
     {
+        if (policy == SelfTradePolicy::Disabled && market_data == nullptr) {
+            return match_without_venue(requested_quantity,
+                                       has_limit_price,
+                                       limit_price,
+                                       order_ids,
+                                       order_pool,
+                                       event_log,
+                                       aggressor_id,
+                                       aggressor_side,
+                                       timestamp);
+        }
+
         MatchResult result{};
         result.requested_quantity = requested_quantity;
         result.remaining_quantity = requested_quantity;
+        bool stop_matching = false;
 
-        while (result.remaining_quantity > 0 && best_slot_ != kInvalidIndex) {
+        while (!stop_matching && result.remaining_quantity > 0 && best_slot_ != kInvalidIndex) {
             const std::uint32_t slot = best_slot_;
             PriceLevel& level = levels_[slot];
             if (has_limit_price && !crosses(level.price(), limit_price)) {
@@ -821,6 +1137,80 @@ public:
             while (result.remaining_quantity > 0 && !level.empty()) {
                 Order* resting_order = level.front();
                 const OrderId resting_id = resting_order->id;
+                const ParticipantId resting_participant = resting_order->participant_id;
+                const bool self_trade = policy != SelfTradePolicy::Disabled &&
+                                        aggressor_participant != kAnonymousParticipantId &&
+                                        resting_participant == aggressor_participant;
+                if (self_trade) {
+                    if (policy == SelfTradePolicy::CancelAggressor) {
+                        result.aggressor_cancelled_by_stp = true;
+                        stop_matching = true;
+                        break;
+                    }
+
+                    const Price resting_price = level.price();
+                    Quantity previous_level_quantity = 0;
+                    BestQuote previous_best{};
+                    if (market_data != nullptr) {
+                        previous_level_quantity = level.total_quantity();
+                        previous_best = best_quote();
+                    }
+                    const Quantity canceled_quantity = resting_order->quantity;
+                    if (!level.remove(*resting_order)) {
+                        result.status = Status::InternalError;
+                        return result;
+                    }
+                    static_cast<void>(order_ids.erase(resting_id));
+                    resting_order->clear();
+                    order_pool.release(resting_order);
+                    if (result.resting_orders_cancelled_by_stp != std::numeric_limits<std::uint32_t>::max()) {
+                        ++result.resting_orders_cancelled_by_stp;
+                    }
+                    event_log.append_order(BookEvent::Kind::OrderCancelled,
+                                           Status::SelfTradePrevented,
+                                           resting_id,
+                                           side_,
+                                           resting_price,
+                                           canceled_quantity,
+                                           timestamp);
+
+                    const bool level_empty = level.empty();
+                    const Quantity new_level_quantity =
+                        market_data == nullptr ? 0 : level.total_quantity();
+                    const std::uint32_t new_order_count =
+                        market_data == nullptr ? 0 : level.order_count();
+                    if (level_empty) {
+                        remove_occupied_level(slot);
+                    }
+                    if (market_data != nullptr) {
+                        emit_market_data_level_change(market_data,
+                                                      side_,
+                                                      resting_price,
+                                                      previous_level_quantity,
+                                                      new_level_quantity,
+                                                      new_order_count,
+                                                      previous_best,
+                                                      best_quote(),
+                                                      timestamp);
+                    }
+                    if (policy == SelfTradePolicy::CancelBoth) {
+                        result.aggressor_cancelled_by_stp = true;
+                        stop_matching = true;
+                        break;
+                    }
+                    if (level_empty) {
+                        break;
+                    }
+                    continue;
+                }
+
+                const Price resting_price = level.price();
+                Quantity previous_level_quantity = 0;
+                BestQuote previous_best{};
+                if (market_data != nullptr) {
+                    previous_level_quantity = level.total_quantity();
+                    previous_best = best_quote();
+                }
                 const Quantity executed_quantity = level.fill_front(result.remaining_quantity);
                 if (executed_quantity == 0) {
                     result.status = Status::InternalError;
@@ -831,9 +1221,13 @@ public:
                 result.executed_quantity += executed_quantity;
                 ++result.fills;
                 result.has_last_price = true;
-                result.last_price = level.price();
+                result.last_price = resting_price;
                 event_log.append_trade(
-                    aggressor_id, resting_id, aggressor_side, level.price(), executed_quantity, timestamp);
+                    aggressor_id, resting_id, aggressor_side, resting_price, executed_quantity, timestamp);
+                if (market_data != nullptr) {
+                    market_data->append_trade(
+                        aggressor_side, resting_price, executed_quantity, aggressor_id, resting_id, timestamp);
+                }
 
                 if (resting_order->quantity == 0) {
                     if (!level.remove(*resting_order)) {
@@ -844,14 +1238,35 @@ public:
                     resting_order->clear();
                     order_pool.release(resting_order);
                 }
-            }
 
-            if (level.empty()) {
-                remove_occupied_level(slot);
+                const bool level_empty = level.empty();
+                const Quantity new_level_quantity =
+                    market_data == nullptr ? 0 : level.total_quantity();
+                const std::uint32_t new_order_count =
+                    market_data == nullptr ? 0 : level.order_count();
+                if (level_empty) {
+                    remove_occupied_level(slot);
+                }
+                if (market_data != nullptr) {
+                    emit_market_data_level_change(market_data,
+                                                  side_,
+                                                  resting_price,
+                                                  previous_level_quantity,
+                                                  new_level_quantity,
+                                                  new_order_count,
+                                                  previous_best,
+                                                  best_quote(),
+                                                  timestamp);
+                }
+                if (level_empty) {
+                    break;
+                }
             }
         }
 
-        if (result.executed_quantity == 0) {
+        if (result.aggressor_cancelled_by_stp && result.executed_quantity == 0) {
+            result.status = Status::SelfTradePrevented;
+        } else if (result.executed_quantity == 0) {
             result.status = Status::NoLiquidity;
         } else if (result.remaining_quantity == 0) {
             result.status = Status::Filled;
@@ -992,6 +1407,61 @@ private:
     std::unique_ptr<MapEntry[]> level_map_;
     std::uint32_t level_map_size_{0};
     std::uint32_t level_map_tombstones_{0};
+
+    [[nodiscard]] MatchResult match_without_venue(const Quantity requested_quantity,
+                                                  const bool has_limit_price,
+                                                  const Price limit_price,
+                                                  OrderIdMap& order_ids,
+                                                  MemoryPool<Order>& order_pool,
+                                                  EventLog& event_log,
+                                                  const OrderId aggressor_id,
+                                                  const Side aggressor_side,
+                                                  const Timestamp timestamp) noexcept
+    {
+        MatchResult result{};
+        result.requested_quantity = requested_quantity;
+        result.remaining_quantity = requested_quantity;
+        while (result.remaining_quantity > 0 && best_slot_ != kInvalidIndex) {
+            const std::uint32_t slot = best_slot_;
+            PriceLevel& level = levels_[slot];
+            if (has_limit_price && !crosses(level.price(), limit_price)) {
+                break;
+            }
+            while (result.remaining_quantity > 0 && !level.empty()) {
+                Order* const resting_order = level.front();
+                const OrderId resting_id = resting_order->id;
+                const Quantity executed = level.fill_front(result.remaining_quantity);
+                if (executed == 0) {
+                    result.status = Status::InternalError;
+                    return result;
+                }
+                result.remaining_quantity -= executed;
+                result.executed_quantity += executed;
+                ++result.fills;
+                result.has_last_price = true;
+                result.last_price = level.price();
+                event_log.append_trade(
+                    aggressor_id, resting_id, aggressor_side, level.price(), executed, timestamp);
+                if (resting_order->quantity == 0) {
+                    if (!level.remove(*resting_order)) {
+                        result.status = Status::InternalError;
+                        return result;
+                    }
+                    static_cast<void>(order_ids.erase(resting_id));
+                    resting_order->clear();
+                    order_pool.release(resting_order);
+                }
+            }
+            if (level.empty()) {
+                remove_occupied_level(slot);
+            }
+        }
+        result.status = result.executed_quantity == 0
+                            ? Status::NoLiquidity
+                            : (result.remaining_quantity == 0 ? Status::Filled
+                                                              : Status::PartiallyFilled);
+        return result;
+    }
 
     [[nodiscard]] static std::uint32_t compute_level_count(const Price min_price,
                                                            const Price max_price,
@@ -1370,6 +1840,18 @@ public:
                         : dense_side().executable_fill_count(requested_quantity, has_limit_price, limit_price);
     }
 
+    [[nodiscard]] MatchPreflight preflight(const Quantity requested_quantity,
+                                           const bool has_limit_price,
+                                           const Price limit_price,
+                                           const ParticipantId aggressor_participant,
+                                           const SelfTradePolicy policy) const noexcept
+    {
+        return sparse() ? sparse_side().preflight(
+                              requested_quantity, has_limit_price, limit_price, aggressor_participant, policy)
+                        : dense_side().preflight(
+                              requested_quantity, has_limit_price, limit_price, aggressor_participant, policy);
+    }
+
     [[nodiscard]] MatchResult match(const Quantity requested_quantity,
                                     const bool has_limit_price,
                                     const Price limit_price,
@@ -1378,7 +1860,10 @@ public:
                                     EventLog& event_log,
                                     const OrderId aggressor_id,
                                     const Side aggressor_side,
-                                    const Timestamp timestamp) noexcept
+                                    const Timestamp timestamp,
+                                    const ParticipantId aggressor_participant = kAnonymousParticipantId,
+                                    const SelfTradePolicy policy = SelfTradePolicy::Disabled,
+                                    MarketDataLog* const market_data = nullptr) noexcept
     {
         return sparse() ? sparse_side().match(requested_quantity,
                                              has_limit_price,
@@ -1388,7 +1873,10 @@ public:
                                              event_log,
                                              aggressor_id,
                                              aggressor_side,
-                                             timestamp)
+                                             timestamp,
+                                             aggressor_participant,
+                                             policy,
+                                             market_data)
                         : dense_side().match(requested_quantity,
                                              has_limit_price,
                                              limit_price,
@@ -1397,7 +1885,10 @@ public:
                                              event_log,
                                              aggressor_id,
                                              aggressor_side,
-                                             timestamp);
+                                             timestamp,
+                                             aggressor_participant,
+                                             policy,
+                                             market_data);
     }
 
     [[nodiscard]] BestQuote best_quote() const noexcept

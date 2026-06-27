@@ -10,6 +10,7 @@ namespace eigenbook {
 
 using OrderId = std::uint64_t;
 using InstrumentId = std::uint32_t;
+using ParticipantId = std::uint64_t;
 using Price = std::int64_t;
 using Quantity = std::uint64_t;
 using Timestamp = std::uint64_t;
@@ -17,6 +18,7 @@ using SequenceNumber = std::uint64_t;
 
 inline constexpr OrderId kInvalidOrderId = 0;
 inline constexpr InstrumentId kInvalidInstrumentId = 0;
+inline constexpr ParticipantId kAnonymousParticipantId = 0;
 inline constexpr std::uint32_t kInvalidIndex = std::numeric_limits<std::uint32_t>::max();
 inline constexpr std::size_t kProbeHistogramBucketCount = 16;
 
@@ -29,6 +31,16 @@ enum class TimeInForce : std::uint8_t {
     Gtc,
     Ioc,
     Fok,
+};
+
+/// Self-trade prevention policy applied by one instrument.
+///
+/// Participant id zero is anonymous and never triggers STP.
+enum class SelfTradePolicy : std::uint8_t {
+    Disabled,
+    CancelAggressor,
+    CancelResting,
+    CancelBoth,
 };
 
 enum class PriceLevelMode : std::uint8_t {
@@ -76,13 +88,24 @@ enum class Status : std::uint8_t {
     SnapshotCapacityExceeded,
     InvalidCommand,
     EventLogFull,
+    LotSizeViolation,
+    PostOnlyWouldCross,
+    InvalidPostOnlyTimeInForce,
+    SelfTradePrevented,
+    MarketDataLogFull,
+    JournalFormatMismatch,
+    JournalVersionMismatch,
+    JournalLengthMismatch,
+    JournalChecksumMismatch,
+    JournalInvalidField,
+    ReplayDiverged,
 
     // Compatibility aliases for older call sites.
     Ok = Accepted,
     OrderNotFound = UnknownOrderId,
 };
 
-inline constexpr std::size_t kStatusCount = static_cast<std::size_t>(Status::EventLogFull) + 1U;
+inline constexpr std::size_t kStatusCount = static_cast<std::size_t>(Status::ReplayDiverged) + 1U;
 
 struct TradeEvent final {
     InstrumentId instrument_id{kInvalidInstrumentId};
@@ -120,6 +143,35 @@ struct BookEvent final {
     TradeEvent trade{};
 };
 
+/// One sequenced incremental market-data update.
+///
+/// A command may emit zero or more events. Sequence numbers are contiguous and
+/// per instrument; rejected commands and commands with no visible book change
+/// emit no market data and consume no market-data sequence number.
+struct MarketDataEvent final {
+    enum class Kind : std::uint8_t {
+        LevelCreated,
+        LevelQuantityChanged,
+        LevelDeleted,
+        Trade,
+        BestBidChanged,
+        BestAskChanged,
+    };
+
+    Kind kind{Kind::LevelQuantityChanged};
+    InstrumentId instrument_id{kInvalidInstrumentId};
+    SequenceNumber sequence{0};
+    Side side{Side::Buy};
+    Price price{0};
+    Quantity previous_quantity{0};
+    Quantity quantity{0};
+    std::uint32_t order_count{0};
+    OrderId aggressor_id{kInvalidOrderId};
+    OrderId resting_id{kInvalidOrderId};
+    Quantity trade_quantity{0};
+    Timestamp timestamp{0};
+};
+
 [[nodiscard]] constexpr std::uint64_t price_distance(const Price lower, const Price upper) noexcept
 {
     return static_cast<std::uint64_t>(upper) - static_cast<std::uint64_t>(lower);
@@ -135,11 +187,18 @@ struct BookConfig final {
     std::uint32_t event_log_capacity{0};
     /// Selects dense or sparse fixed storage for price levels.
     PriceLevelMode price_level_mode{PriceLevelMode::Dense};
+    /// `0` or `1` disables quantity-increment enforcement.
+    Quantity lot_size{0};
+    /// Instrument-wide self-trade prevention policy.
+    SelfTradePolicy self_trade_policy{SelfTradePolicy::Disabled};
+    /// `0` disables incremental market-data generation.
+    std::uint32_t market_data_capacity{0};
 
     [[nodiscard]] bool valid() const noexcept
     {
         if (min_price > max_price || max_orders == 0 || tick_size <= 0 ||
-            (price_level_mode != PriceLevelMode::Dense && price_level_mode != PriceLevelMode::Sparse)) {
+            (price_level_mode != PriceLevelMode::Dense && price_level_mode != PriceLevelMode::Sparse) ||
+            self_trade_policy > SelfTradePolicy::CancelBoth) {
             return false;
         }
 
@@ -221,6 +280,8 @@ struct InstrumentConfig final {
     BookConfig book_config{};
     Price tick_size{0};
     Quantity lot_size{0};
+    SelfTradePolicy self_trade_policy{SelfTradePolicy::Disabled};
+    std::uint32_t market_data_capacity{0};
 };
 
 struct BestQuote final {
@@ -242,6 +303,13 @@ struct DepthLevel final {
     std::uint32_t order_count{0};
 };
 
+struct MatchPreflight final {
+    Quantity executable_quantity{0};
+    std::uint32_t fill_count{0};
+    std::uint32_t resting_cancel_count{0};
+    bool aggressor_cancelled{false};
+};
+
 struct BookSnapshotOrder final {
     OrderId id{kInvalidOrderId};
     Side side{Side::Buy};
@@ -249,6 +317,8 @@ struct BookSnapshotOrder final {
     Quantity quantity{0};
     Timestamp timestamp{0};
     SequenceNumber sequence{0};
+    ParticipantId participant_id{kAnonymousParticipantId};
+    bool post_only{false};
 };
 
 struct BookSnapshotLevelAggregate final {
@@ -315,6 +385,8 @@ struct MatchResult final {
     std::uint32_t events_emitted{0};
     /// OrderBook-owned storage; valid until the next mutating call on that book.
     std::span<const BookEvent> events{};
+    bool aggressor_cancelled_by_stp{false};
+    std::uint32_t resting_orders_cancelled_by_stp{0};
 };
 
 /// Common return shape for `MatchingEngine::dispatch`.
@@ -340,6 +412,10 @@ struct DispatchResult final {
     std::uint32_t events_emitted{0};
     /// OrderBook-owned storage; valid until the next mutating call on that book.
     std::span<const BookEvent> events{};
+    bool aggressor_cancelled_by_stp{false};
+    std::uint32_t resting_orders_cancelled_by_stp{0};
+    std::uint32_t market_data_events_emitted{0};
+    std::span<const MarketDataEvent> market_data_events{};
 };
 
 struct SnapshotWriteResult final {

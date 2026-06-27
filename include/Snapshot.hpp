@@ -11,7 +11,7 @@
 
 namespace eigenbook {
 
-inline constexpr std::uint8_t kSnapshotFormatVersion = 2;
+inline constexpr std::uint8_t kSnapshotFormatVersion = 3;
 
 template <std::uint32_t MaxOrders, std::uint32_t MaxLevels>
 struct BookSnapshot final {
@@ -20,6 +20,7 @@ struct BookSnapshot final {
     BookConfig config{};
     SequenceNumber next_sequence{0};
     SequenceNumber event_next_sequence{0};
+    SequenceNumber market_data_sequence{0};
     std::uint32_t order_count{0};
     std::array<BookSnapshotOrder, MaxOrders> orders{};
     std::uint32_t level_count{0};
@@ -51,6 +52,11 @@ struct SnapshotAccess final {
         return book.snapshot_event_next_sequence();
     }
 
+    [[nodiscard]] static SequenceNumber market_data_sequence(const OrderBook& book) noexcept
+    {
+        return book.snapshot_market_data_sequence();
+    }
+
     [[nodiscard]] static std::uint32_t level_count(const OrderBook& book) noexcept
     {
         return book.snapshot_level_count();
@@ -78,11 +84,17 @@ struct SnapshotAccess final {
         return book.restore_snapshot_order(order);
     }
 
+    [[nodiscard]] static detail::SnapshotValidationWorkspace& validation_workspace(OrderBook& book) noexcept
+    {
+        return book.snapshot_validation_;
+    }
+
     static void finish_book_restore(OrderBook& book,
                                     const SequenceNumber next_sequence,
-                                    const SequenceNumber event_next_sequence) noexcept
+                                    const SequenceNumber event_next_sequence,
+                                    const SequenceNumber market_data_sequence) noexcept
     {
-        book.finish_snapshot_restore(next_sequence, event_next_sequence);
+        book.finish_snapshot_restore(next_sequence, event_next_sequence, market_data_sequence);
     }
 
     [[nodiscard]] static bool valid(const MatchingEngine& engine) noexcept
@@ -125,11 +137,12 @@ struct SnapshotAccess final {
 
 namespace detail {
 
-inline constexpr std::size_t kBookOrderWireSize = 8 + 1 + 8 + 8 + 8 + 8;
+inline constexpr std::size_t kBookOrderWireSize = 8 + 1 + 8 + 8 + 8 + 8 + 8 + 1;
 inline constexpr std::size_t kLevelWireSize = 1 + 8 + 8 + 4;
-inline constexpr std::size_t kConfigWireSize = 8 + 8 + 4 + 4 + 8 + 4 + 1;
-inline constexpr std::size_t kInstrumentConfigWireSize = 4 + kConfigWireSize + 8 + 8;
-inline constexpr std::size_t kBookHeaderWireSize = 4 + 1 + 3 + 4 + kConfigWireSize + 4 + 4 + 8 + 8;
+inline constexpr std::size_t kConfigWireSize = 8 + 8 + 4 + 4 + 8 + 4 + 1 + 8 + 1 + 4;
+inline constexpr std::size_t kInstrumentConfigWireSize = 4 + kConfigWireSize + 8 + 8 + 1 + 4;
+inline constexpr std::size_t kBookHeaderWireSize =
+    4 + 1 + 3 + 4 + kConfigWireSize + 4 + 4 + 8 + 8 + 8;
 inline constexpr std::size_t kEngineHeaderWireSize = 4 + 1 + 3 + 4 + 4 + 1 + 3;
 
 class SnapshotWriter final {
@@ -287,6 +300,7 @@ struct BookHeaderInfo final {
     std::uint32_t level_count{0};
     SequenceNumber next_sequence{0};
     SequenceNumber event_next_sequence{0};
+    SequenceNumber market_data_sequence{0};
     std::size_t orders_offset{0};
     std::size_t levels_offset{0};
     std::size_t end_offset{0};
@@ -325,14 +339,18 @@ struct EngineHeaderInfo final {
     return lhs.min_price == rhs.min_price && lhs.max_price == rhs.max_price &&
            lhs.max_orders == rhs.max_orders && lhs.order_id_map_capacity == rhs.order_id_map_capacity &&
            lhs.tick_size == rhs.tick_size && lhs.event_log_capacity == rhs.event_log_capacity &&
-           lhs.price_level_mode == rhs.price_level_mode;
+           lhs.price_level_mode == rhs.price_level_mode && lhs.lot_size == rhs.lot_size &&
+           lhs.self_trade_policy == rhs.self_trade_policy &&
+           lhs.market_data_capacity == rhs.market_data_capacity;
 }
 
 [[nodiscard]] inline bool same_instrument_config(const InstrumentConfig& lhs,
                                                  const InstrumentConfig& rhs) noexcept
 {
     return lhs.instrument_id == rhs.instrument_id && same_config(lhs.book_config, rhs.book_config) &&
-           lhs.tick_size == rhs.tick_size && lhs.lot_size == rhs.lot_size;
+           lhs.tick_size == rhs.tick_size && lhs.lot_size == rhs.lot_size &&
+           lhs.self_trade_policy == rhs.self_trade_policy &&
+           lhs.market_data_capacity == rhs.market_data_capacity;
 }
 
 [[nodiscard]] inline bool valid_side(const Side side) noexcept
@@ -357,17 +375,25 @@ inline void write_config(SnapshotWriter& writer, const BookConfig& config) noexc
     writer.write_price(config.tick_size);
     writer.write_u32(config.event_log_capacity);
     writer.write_u8(static_cast<std::uint8_t>(config.price_level_mode));
+    writer.write_u64(config.lot_size);
+    writer.write_u8(static_cast<std::uint8_t>(config.self_trade_policy));
+    writer.write_u32(config.market_data_capacity);
 }
 
 [[nodiscard]] inline bool read_config(SnapshotReader& reader, BookConfig& config) noexcept
 {
     std::uint8_t price_level_mode = 0;
+    std::uint8_t self_trade_policy = 0;
     return reader.read_price(config.min_price) && reader.read_price(config.max_price) &&
            reader.read_u32(config.max_orders) && reader.read_u32(config.order_id_map_capacity) &&
            reader.read_price(config.tick_size) && reader.read_u32(config.event_log_capacity) &&
            reader.read_u8(price_level_mode) &&
            (price_level_mode <= static_cast<std::uint8_t>(PriceLevelMode::Sparse)) &&
-           (config.price_level_mode = static_cast<PriceLevelMode>(price_level_mode), true);
+           (config.price_level_mode = static_cast<PriceLevelMode>(price_level_mode), true) &&
+           reader.read_u64(config.lot_size) && reader.read_u8(self_trade_policy) &&
+           self_trade_policy <= static_cast<std::uint8_t>(SelfTradePolicy::CancelBoth) &&
+           (config.self_trade_policy = static_cast<SelfTradePolicy>(self_trade_policy), true) &&
+           reader.read_u32(config.market_data_capacity);
 }
 
 inline void write_instrument_config(SnapshotWriter& writer, const InstrumentConfig& config) noexcept
@@ -376,12 +402,19 @@ inline void write_instrument_config(SnapshotWriter& writer, const InstrumentConf
     write_config(writer, config.book_config);
     writer.write_price(config.tick_size);
     writer.write_u64(config.lot_size);
+    writer.write_u8(static_cast<std::uint8_t>(config.self_trade_policy));
+    writer.write_u32(config.market_data_capacity);
 }
 
 [[nodiscard]] inline bool read_instrument_config(SnapshotReader& reader, InstrumentConfig& config) noexcept
 {
+    std::uint8_t self_trade_policy = 0;
     return reader.read_u32(config.instrument_id) && read_config(reader, config.book_config) &&
-           reader.read_price(config.tick_size) && reader.read_u64(config.lot_size);
+           reader.read_price(config.tick_size) && reader.read_u64(config.lot_size) &&
+           reader.read_u8(self_trade_policy) &&
+           self_trade_policy <= static_cast<std::uint8_t>(SelfTradePolicy::CancelBoth) &&
+           (config.self_trade_policy = static_cast<SelfTradePolicy>(self_trade_policy), true) &&
+           reader.read_u32(config.market_data_capacity);
 }
 
 inline void write_order(SnapshotWriter& writer, const BookSnapshotOrder& order) noexcept
@@ -392,18 +425,23 @@ inline void write_order(SnapshotWriter& writer, const BookSnapshotOrder& order) 
     writer.write_u64(order.quantity);
     writer.write_u64(order.timestamp);
     writer.write_u64(order.sequence);
+    writer.write_u64(order.participant_id);
+    writer.write_u8(order.post_only ? 1U : 0U);
 }
 
 [[nodiscard]] inline bool read_order(SnapshotReader& reader, BookSnapshotOrder& order) noexcept
 {
     std::uint8_t side = 0;
+    std::uint8_t post_only = 0;
     if (!reader.read_u64(order.id) || !reader.read_u8(side) || side > static_cast<std::uint8_t>(Side::Sell) ||
         !reader.read_price(order.price) || !reader.read_u64(order.quantity) ||
-        !reader.read_u64(order.timestamp) || !reader.read_u64(order.sequence)) {
+        !reader.read_u64(order.timestamp) || !reader.read_u64(order.sequence) ||
+        !reader.read_u64(order.participant_id) || !reader.read_u8(post_only) || post_only > 1U) {
         return false;
     }
 
     order.side = static_cast<Side>(side);
+    order.post_only = post_only != 0;
     return true;
 }
 
@@ -476,7 +514,8 @@ inline void write_level(SnapshotWriter& writer, const BookSnapshotLevelAggregate
 
     if (!reader.read_u32(header.instrument_id) || !read_config(reader, header.config) ||
         !reader.read_u32(header.order_count) || !reader.read_u32(header.level_count) ||
-        !reader.read_u64(header.next_sequence) || !reader.read_u64(header.event_next_sequence)) {
+        !reader.read_u64(header.next_sequence) || !reader.read_u64(header.event_next_sequence) ||
+        !reader.read_u64(header.market_data_sequence)) {
         return Status::SnapshotFormatMismatch;
     }
 
@@ -504,115 +543,17 @@ inline void write_level(SnapshotWriter& writer, const BookSnapshotLevelAggregate
     return Status::Accepted;
 }
 
-[[nodiscard]] inline Status validate_order_record(std::span<const std::byte> buffer,
-                                                  const BookHeaderInfo& header,
-                                                  const std::uint32_t index,
-                                                  BookSnapshotOrder& order) noexcept
+[[nodiscard]] inline std::uint64_t snapshot_level_key(const BookConfig& config,
+                                                      const Side side,
+                                                      const Price price) noexcept
 {
-    const std::size_t offset = header.orders_offset + static_cast<std::size_t>(index) * kBookOrderWireSize;
-    if (!read_order_at(buffer, offset, order)) {
-        return Status::SnapshotFormatMismatch;
-    }
-    if (order.id == kInvalidOrderId || !valid_side(order.side) || order.quantity == 0 ||
-        !valid_price_for_config(header.config, order.price) || order.sequence == 0 ||
-        order.sequence > header.next_sequence) {
-        return Status::SnapshotFormatMismatch;
-    }
-
-    for (std::uint32_t previous = 0; previous < index; ++previous) {
-        BookSnapshotOrder previous_order{};
-        const std::size_t previous_offset =
-            header.orders_offset + static_cast<std::size_t>(previous) * kBookOrderWireSize;
-        if (!read_order_at(buffer, previous_offset, previous_order)) {
-            return Status::SnapshotFormatMismatch;
-        }
-        if (previous_order.id == order.id) {
-            return Status::SnapshotFormatMismatch;
-        }
-        if (previous_order.sequence == order.sequence &&
-            order.sequence != std::numeric_limits<SequenceNumber>::max()) {
-            return Status::SnapshotFormatMismatch;
-        }
-        if (previous_order.side == order.side && previous_order.price == order.price &&
-            previous_order.sequence > order.sequence) {
-            return Status::SnapshotFormatMismatch;
-        }
-    }
-
-    return Status::Accepted;
+    const auto tick = static_cast<std::uint64_t>(config.tick_size);
+    const std::uint64_t price_index = price_distance(config.min_price, price) / tick;
+    const std::uint64_t side_key = side == Side::Sell ? (1ULL << 32U) : 0U;
+    return side_key | price_index;
 }
 
-[[nodiscard]] inline Status validate_level_record(std::span<const std::byte> buffer,
-                                                  const BookHeaderInfo& header,
-                                                  const std::uint32_t index,
-                                                  BookSnapshotLevelAggregate& level) noexcept
-{
-    const std::size_t offset = header.levels_offset + static_cast<std::size_t>(index) * kLevelWireSize;
-    if (!read_level_at(buffer, offset, level)) {
-        return Status::SnapshotFormatMismatch;
-    }
-    if (!valid_side(level.side) || !valid_price_for_config(header.config, level.price) ||
-        level.aggregate_quantity == 0 || level.order_count == 0) {
-        return Status::SnapshotFormatMismatch;
-    }
-
-    for (std::uint32_t previous = 0; previous < index; ++previous) {
-        BookSnapshotLevelAggregate previous_level{};
-        const std::size_t previous_offset =
-            header.levels_offset + static_cast<std::size_t>(previous) * kLevelWireSize;
-        if (!read_level_at(buffer, previous_offset, previous_level)) {
-            return Status::SnapshotFormatMismatch;
-        }
-        if (previous_level.side == level.side && previous_level.price == level.price) {
-            return Status::SnapshotFormatMismatch;
-        }
-    }
-
-    Quantity aggregate = 0;
-    std::uint32_t count = 0;
-    for (std::uint32_t order_index = 0; order_index < header.order_count; ++order_index) {
-        BookSnapshotOrder order{};
-        const std::size_t order_offset =
-            header.orders_offset + static_cast<std::size_t>(order_index) * kBookOrderWireSize;
-        if (!read_order_at(buffer, order_offset, order)) {
-            return Status::SnapshotFormatMismatch;
-        }
-        if (order.side == level.side && order.price == level.price) {
-            if (std::numeric_limits<Quantity>::max() - aggregate < order.quantity) {
-                return Status::SnapshotFormatMismatch;
-            }
-            aggregate += order.quantity;
-            ++count;
-        }
-    }
-
-    if (aggregate != level.aggregate_quantity || count != level.order_count) {
-        return Status::SnapshotFormatMismatch;
-    }
-
-    return Status::Accepted;
-}
-
-[[nodiscard]] inline Status validate_order_has_level(std::span<const std::byte> buffer,
-                                                     const BookHeaderInfo& header,
-                                                     const BookSnapshotOrder& order) noexcept
-{
-    for (std::uint32_t level_index = 0; level_index < header.level_count; ++level_index) {
-        BookSnapshotLevelAggregate level{};
-        const std::size_t level_offset =
-            header.levels_offset + static_cast<std::size_t>(level_index) * kLevelWireSize;
-        if (!read_level_at(buffer, level_offset, level)) {
-            return Status::SnapshotFormatMismatch;
-        }
-        if (level.side == order.side && level.price == order.price) {
-            return Status::Accepted;
-        }
-    }
-
-    return Status::SnapshotFormatMismatch;
-}
-
-[[nodiscard]] inline Status validate_book_snapshot(const OrderBook& target,
+[[nodiscard]] inline Status validate_book_snapshot(OrderBook& target,
                                                    std::span<const std::byte> buffer,
                                                    BookHeaderInfo& header,
                                                    const bool require_exact) noexcept
@@ -646,18 +587,33 @@ inline void write_level(SnapshotWriter& writer, const BookSnapshotLevelAggregate
     if (header.order_count == 0 && header.level_count != 0) {
         return Status::SnapshotFormatMismatch;
     }
+    if (header.level_count > header.order_count) {
+        return Status::SnapshotFormatMismatch;
+    }
 
+    SnapshotValidationWorkspace& workspace = SnapshotAccess::validation_workspace(target);
+    if (header.order_count > workspace.capacity()) {
+        return Status::SnapshotCapacityExceeded;
+    }
+
+    SnapshotValidationRecord* const records = workspace.primary();
     bool has_bid = false;
     bool has_ask = false;
     Price best_bid = 0;
     Price best_ask = 0;
     for (std::uint32_t order_index = 0; order_index < header.order_count; ++order_index) {
         BookSnapshotOrder order{};
-        status = validate_order_record(buffer, header, order_index, order);
-        if (status != Status::Accepted) {
-            return status;
+        const std::size_t offset =
+            header.orders_offset + static_cast<std::size_t>(order_index) * kBookOrderWireSize;
+        if (!read_order_at(buffer, offset, order) || order.id == kInvalidOrderId ||
+            !valid_side(order.side) || order.quantity == 0 ||
+            (header.config.lot_size > 1U && order.quantity % header.config.lot_size != 0U) ||
+            !valid_price_for_config(header.config, order.price) || order.sequence == 0 ||
+            order.sequence > header.next_sequence) {
+            return Status::SnapshotFormatMismatch;
         }
 
+        records[order_index] = SnapshotValidationRecord{order.id, 0, order.sequence};
         if (order.side == Side::Buy) {
             if (!has_bid || order.price > best_bid) {
                 best_bid = order.price;
@@ -675,11 +631,21 @@ inline void write_level(SnapshotWriter& writer, const BookSnapshotLevelAggregate
         return Status::SnapshotFormatMismatch;
     }
 
-    for (std::uint32_t level_index = 0; level_index < header.level_count; ++level_index) {
-        BookSnapshotLevelAggregate level{};
-        status = validate_level_record(buffer, header, level_index, level);
-        if (status != Status::Accepted) {
-            return status;
+    workspace.sort_primary(header.order_count);
+    for (std::uint32_t index = 1; index < header.order_count; ++index) {
+        if (records[index - 1U].key == records[index].key) {
+            return Status::SnapshotFormatMismatch;
+        }
+    }
+
+    for (std::uint32_t index = 0; index < header.order_count; ++index) {
+        records[index].key = records[index].auxiliary;
+    }
+    workspace.sort_primary(header.order_count);
+    for (std::uint32_t index = 1; index < header.order_count; ++index) {
+        if (records[index - 1U].key == records[index].key &&
+            records[index].key != std::numeric_limits<SequenceNumber>::max()) {
+            return Status::SnapshotFormatMismatch;
         }
     }
 
@@ -690,11 +656,90 @@ inline void write_level(SnapshotWriter& writer, const BookSnapshotLevelAggregate
         if (!read_order_at(buffer, order_offset, order)) {
             return Status::SnapshotFormatMismatch;
         }
-        status = validate_order_has_level(buffer, header, order);
-        if (status != Status::Accepted) {
-            return status;
+
+        records[order_index] = SnapshotValidationRecord{
+            snapshot_level_key(header.config, order.side, order.price),
+            order.quantity,
+            order.sequence,
+        };
+    }
+    workspace.sort_primary(header.order_count);
+
+    SnapshotValidationRecord* const aggregates = workspace.aggregates();
+    std::uint32_t aggregate_count = 0;
+    for (std::uint32_t index = 0; index < header.order_count; ++index) {
+        const SnapshotValidationRecord& record = records[index];
+        if (index > 0U && records[index - 1U].key == record.key &&
+            records[index - 1U].auxiliary > record.auxiliary) {
+            return Status::SnapshotFormatMismatch;
+        }
+
+        if (aggregate_count == 0U || aggregates[aggregate_count - 1U].key != record.key) {
+            aggregates[aggregate_count] = SnapshotValidationRecord{record.key, record.value, 1U};
+            ++aggregate_count;
+            continue;
+        }
+
+        SnapshotValidationRecord& aggregate = aggregates[aggregate_count - 1U];
+        if (std::numeric_limits<Quantity>::max() - aggregate.value < record.value) {
+            return Status::SnapshotFormatMismatch;
+        }
+        aggregate.value += record.value;
+        ++aggregate.auxiliary;
+    }
+
+    for (std::uint32_t level_index = 0; level_index < header.level_count; ++level_index) {
+        BookSnapshotLevelAggregate level{};
+        const std::size_t offset =
+            header.levels_offset + static_cast<std::size_t>(level_index) * kLevelWireSize;
+        if (!read_level_at(buffer, offset, level) || !valid_side(level.side) ||
+            !valid_price_for_config(header.config, level.price) ||
+            level.aggregate_quantity == 0 || level.order_count == 0) {
+            return Status::SnapshotFormatMismatch;
+        }
+
+        records[level_index] = SnapshotValidationRecord{
+            snapshot_level_key(header.config, level.side, level.price),
+            level.aggregate_quantity,
+            level.order_count,
+        };
+    }
+    workspace.sort_primary(header.level_count);
+
+    for (std::uint32_t index = 1; index < header.level_count; ++index) {
+        if (records[index - 1U].key == records[index].key) {
+            return Status::SnapshotFormatMismatch;
         }
     }
+
+    if (header.level_count != aggregate_count) {
+        return Status::SnapshotFormatMismatch;
+    }
+    for (std::uint32_t index = 0; index < aggregate_count; ++index) {
+        if (records[index].key != aggregates[index].key ||
+            records[index].value != aggregates[index].value ||
+            records[index].auxiliary != aggregates[index].auxiliary) {
+            return Status::SnapshotFormatMismatch;
+        }
+    }
+
+    // Restore in ascending side/price order. This retains FIFO order because
+    // the radix sort is stable and lets sparse price-level storage append each
+    // newly encountered price instead of shifting its sorted slot array.
+    for (std::uint32_t order_index = 0; order_index < header.order_count; ++order_index) {
+        BookSnapshotOrder order{};
+        const std::size_t offset =
+            header.orders_offset + static_cast<std::size_t>(order_index) * kBookOrderWireSize;
+        if (!read_order_at(buffer, offset, order)) {
+            return Status::SnapshotFormatMismatch;
+        }
+        records[order_index] = SnapshotValidationRecord{
+            snapshot_level_key(header.config, order.side, order.price),
+            order_index,
+            0,
+        };
+    }
+    workspace.sort_primary(header.order_count);
 
     return Status::Accepted;
 }
@@ -712,6 +757,7 @@ inline void write_book_snapshot(const OrderBook& book, SnapshotWriter& writer) n
     writer.write_u32(SnapshotAccess::level_count(book));
     writer.write_u64(SnapshotAccess::next_sequence(book));
     writer.write_u64(SnapshotAccess::event_next_sequence(book));
+    writer.write_u64(SnapshotAccess::market_data_sequence(book));
 
     SnapshotAccess::for_each_order(book, [&writer](const Order& order) noexcept {
         write_order(writer,
@@ -722,6 +768,8 @@ inline void write_book_snapshot(const OrderBook& book, SnapshotWriter& writer) n
                         order.quantity,
                         order.timestamp,
                         order.sequence,
+                        order.participant_id,
+                        order.post_only,
                     });
     });
 
@@ -769,7 +817,7 @@ inline void write_book_snapshot(const OrderBook& book, SnapshotWriter& writer) n
     return Status::Accepted;
 }
 
-[[nodiscard]] inline Status validate_engine_snapshot(const MatchingEngine& engine,
+[[nodiscard]] inline Status validate_engine_snapshot(MatchingEngine& engine,
                                                      std::span<const std::byte> buffer,
                                                      EngineHeaderInfo& header) noexcept
 {
@@ -807,7 +855,7 @@ inline void write_book_snapshot(const OrderBook& book, SnapshotWriter& writer) n
         }
         offset += kInstrumentConfigWireSize;
 
-        const OrderBook& target_book = SnapshotAccess::book_at(engine, index);
+        OrderBook& target_book = SnapshotAccess::book_at(engine, index);
         BookHeaderInfo book_header{};
         status = validate_book_snapshot(target_book, buffer.subspan(offset), book_header, false);
         if (status != Status::Accepted) {
@@ -846,6 +894,36 @@ inline void write_engine_snapshot(const MatchingEngine& engine, SnapshotWriter& 
     }
 }
 
+[[nodiscard]] inline Status restore_validated_book(OrderBook& book,
+                                                   std::span<const std::byte> buffer,
+                                                   const BookHeaderInfo& header) noexcept
+{
+    SnapshotAccess::clear_book(book);
+    const SnapshotValidationRecord* const restore_order =
+        SnapshotAccess::validation_workspace(book).primary();
+    for (std::uint32_t index = 0; index < header.order_count; ++index) {
+        BookSnapshotOrder order{};
+        const std::uint32_t snapshot_index =
+            static_cast<std::uint32_t>(restore_order[index].value);
+        const std::size_t offset =
+            header.orders_offset + static_cast<std::size_t>(snapshot_index) * kBookOrderWireSize;
+        if (!read_order_at(buffer, offset, order)) {
+            SnapshotAccess::clear_book(book);
+            return Status::SnapshotFormatMismatch;
+        }
+
+        const Status status = SnapshotAccess::restore_order(book, order);
+        if (status != Status::Accepted) {
+            SnapshotAccess::clear_book(book);
+            return status;
+        }
+    }
+
+    SnapshotAccess::finish_book_restore(
+        book, header.next_sequence, header.event_next_sequence, header.market_data_sequence);
+    return Status::Accepted;
+}
+
 } // namespace detail
 
 [[nodiscard]] inline SnapshotWriteResult serialize(const OrderBook& book,
@@ -872,24 +950,7 @@ inline void write_engine_snapshot(const MatchingEngine& engine, SnapshotWriter& 
         return status;
     }
 
-    SnapshotAccess::clear_book(book);
-    for (std::uint32_t index = 0; index < header.order_count; ++index) {
-        BookSnapshotOrder order{};
-        const std::size_t offset =
-            header.orders_offset + static_cast<std::size_t>(index) * detail::kBookOrderWireSize;
-        if (!detail::read_order_at(buffer, offset, order)) {
-            SnapshotAccess::clear_book(book);
-            return Status::SnapshotFormatMismatch;
-        }
-        status = SnapshotAccess::restore_order(book, order);
-        if (status != Status::Accepted) {
-            SnapshotAccess::clear_book(book);
-            return status;
-        }
-    }
-
-    SnapshotAccess::finish_book_restore(book, header.next_sequence, header.event_next_sequence);
-    return Status::Accepted;
+    return detail::restore_validated_book(book, buffer, header);
 }
 
 [[nodiscard]] inline SnapshotWriteResult serialize(const MatchingEngine& engine,
@@ -927,7 +988,8 @@ inline void write_engine_snapshot(const MatchingEngine& engine, SnapshotWriter& 
         }
 
         OrderBook& target_book = SnapshotAccess::book_at(engine, index);
-        status = restore(target_book, buffer.subspan(offset, book_header.end_offset));
+        status = detail::restore_validated_book(
+            target_book, buffer.subspan(offset, book_header.end_offset), book_header);
         if (status != Status::Accepted) {
             return status;
         }

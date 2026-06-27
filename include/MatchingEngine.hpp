@@ -9,14 +9,79 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <new>
 #include <span>
+#include <utility>
 
 namespace eigenbook {
+
+enum class MatchingEngineInitError : std::uint8_t {
+    None,
+    InstrumentCapacityExceeded,
+    InvalidInstrumentId,
+    InvalidBookConfiguration,
+    DuplicateInstrumentId,
+    AllocationFailure,
+    InternalInsertionFailure,
+};
+
+inline constexpr std::size_t kInvalidInstrumentConfigIndex =
+    std::numeric_limits<std::size_t>::max();
+
+[[nodiscard]] constexpr const char* matching_engine_init_error_name(
+    const MatchingEngineInitError error) noexcept
+{
+    switch (error) {
+    case MatchingEngineInitError::None:
+        return "none";
+    case MatchingEngineInitError::InstrumentCapacityExceeded:
+        return "instrument capacity exceeded";
+    case MatchingEngineInitError::InvalidInstrumentId:
+        return "invalid instrument id";
+    case MatchingEngineInitError::InvalidBookConfiguration:
+        return "invalid order-book configuration";
+    case MatchingEngineInitError::DuplicateInstrumentId:
+        return "duplicate instrument id";
+    case MatchingEngineInitError::AllocationFailure:
+        return "allocation failure";
+    case MatchingEngineInitError::InternalInsertionFailure:
+        return "internal instrument insertion failure";
+    }
+
+    return "unknown matching-engine initialization error";
+}
+
+struct MatchingEngineCreateResult;
 
 class alignas(64) MatchingEngine final {
     friend struct SnapshotAccess;
 
 public:
+    /// Construct only a fully initialized engine.
+    ///
+    /// Failed results contain no engine and identify the first invalid
+    /// configuration entry. The `max_instruments` overload permits spare
+    /// preallocated instrument capacity.
+    template <std::size_t N>
+    [[nodiscard]] static MatchingEngineCreateResult create(
+        const InstrumentConfig (&configs)[N]) noexcept;
+
+    template <std::size_t N>
+    [[nodiscard]] static MatchingEngineCreateResult create(
+        std::uint32_t max_instruments,
+        const InstrumentConfig (&configs)[N]) noexcept;
+
+    [[nodiscard]] static MatchingEngineCreateResult create(
+        std::span<const InstrumentConfig> configs) noexcept;
+
+    [[nodiscard]] static MatchingEngineCreateResult create(
+        std::uint32_t max_instruments,
+        std::span<const InstrumentConfig> configs) noexcept;
+
+    /// Compatibility constructor. Prefer `create()` for new code.
+    ///
+    /// On failure this object retains only the initialization diagnostic. All
+    /// instrument and lookup state is destroyed, so commands fail closed.
     template <std::size_t N>
     explicit MatchingEngine(const InstrumentConfig (&configs)[N])
         : MatchingEngine(span_size_to_u32(N), std::span<const InstrumentConfig, N>(configs))
@@ -37,19 +102,33 @@ public:
     MatchingEngine(const std::uint32_t max_instruments,
                    const std::span<const InstrumentConfig> configs)
         : max_instruments_(max_instruments),
-          instruments_(max_instruments == 0 ? nullptr : std::make_unique<InstrumentState[]>(max_instruments)),
-          lookup_capacity_(lookup_capacity_for(max_instruments)),
-          lookup_(lookup_capacity_ == 0 ? nullptr : std::make_unique<LookupSlot[]>(lookup_capacity_))
+          lookup_capacity_(lookup_capacity_for(max_instruments))
     {
-        if (configs.size() > static_cast<std::size_t>(max_instruments_)) {
-            valid_ = false;
+        const InitializationDiagnostic validation =
+            validate_configurations(max_instruments_, configs);
+        if (validation.error != MatchingEngineInitError::None) {
+            fail_initialization(validation.error, validation.config_index);
             return;
         }
 
-        for (const InstrumentConfig& config : configs) {
-            if (!insert_instrument(config)) {
-                valid_ = false;
+        std::size_t initializing_index = kInvalidInstrumentConfigIndex;
+        try {
+            instruments_ =
+                max_instruments_ == 0 ? nullptr : std::make_unique<InstrumentState[]>(max_instruments_);
+            lookup_ =
+                lookup_capacity_ == 0 ? nullptr : std::make_unique<LookupSlot[]>(lookup_capacity_);
+
+            for (std::size_t index = 0; index < configs.size(); ++index) {
+                initializing_index = index;
+                const MatchingEngineInitError error = insert_instrument(configs[index]);
+                if (error != MatchingEngineInitError::None) {
+                    fail_initialization(error, index);
+                    return;
+                }
             }
+        } catch (const std::bad_alloc&) {
+            fail_initialization(
+                MatchingEngineInitError::AllocationFailure, initializing_index);
         }
     }
 
@@ -64,14 +143,18 @@ public:
                                                  const Price price,
                                                  const Quantity quantity,
                                                  const Timestamp timestamp = 0,
-                                                 const TimeInForce time_in_force = TimeInForce::Gtc) noexcept
+                                                 const TimeInForce time_in_force = TimeInForce::Gtc,
+                                                 const ParticipantId participant_id =
+                                                     kAnonymousParticipantId,
+                                                 const bool post_only = false) noexcept
     {
         OrderBook* book = find_book(instrument_id);
         if (book == nullptr) {
             return unknown_result<AddOrderResult>();
         }
 
-        AddOrderResult result = book->add_limit_order(id, side, price, quantity, timestamp, time_in_force);
+        AddOrderResult result =
+            book->add_limit_order(id, side, price, quantity, timestamp, time_in_force, participant_id, post_only);
         record_event_high_water(result.events_emitted);
         return result;
     }
@@ -124,9 +207,10 @@ public:
                                         const OrderId id,
                                         const Price new_price,
                                         const Quantity new_quantity,
-                                        const TimeInForce time_in_force = TimeInForce::Gtc) noexcept
+                                        const TimeInForce time_in_force = TimeInForce::Gtc,
+                                        const bool post_only = false) noexcept
     {
-        return replace(instrument_id, id, new_price, new_quantity, 0, time_in_force);
+        return replace(instrument_id, id, new_price, new_quantity, 0, time_in_force, post_only);
     }
 
     [[nodiscard]] ReplaceResult replace(const InstrumentId instrument_id,
@@ -134,14 +218,16 @@ public:
                                         const Price new_price,
                                         const Quantity new_quantity,
                                         const Timestamp timestamp,
-                                        const TimeInForce time_in_force) noexcept
+                                        const TimeInForce time_in_force,
+                                        const bool post_only = false) noexcept
     {
         OrderBook* book = find_book(instrument_id);
         if (book == nullptr) {
             return unknown_result<ReplaceResult>();
         }
 
-        ReplaceResult result = book->replace_order(id, new_price, new_quantity, timestamp, time_in_force);
+        ReplaceResult result =
+            book->replace_order(id, new_price, new_quantity, timestamp, time_in_force, post_only);
         record_event_high_water(result.events_emitted);
         return result;
     }
@@ -154,9 +240,10 @@ public:
                                               const OrderId id,
                                               const Price new_price,
                                               const Quantity new_quantity,
-                                              const TimeInForce time_in_force = TimeInForce::Gtc) noexcept
+                                              const TimeInForce time_in_force = TimeInForce::Gtc,
+                                              const bool post_only = false) noexcept
     {
-        return replace(instrument_id, id, new_price, new_quantity, time_in_force);
+        return replace(instrument_id, id, new_price, new_quantity, time_in_force, post_only);
     }
 
     /// Route a timestamped replace request to one instrument.
@@ -165,23 +252,27 @@ public:
                                               const Price new_price,
                                               const Quantity new_quantity,
                                               const Timestamp timestamp,
-                                              const TimeInForce time_in_force) noexcept
+                                              const TimeInForce time_in_force,
+                                              const bool post_only = false) noexcept
     {
-        return replace(instrument_id, id, new_price, new_quantity, timestamp, time_in_force);
+        return replace(instrument_id, id, new_price, new_quantity, timestamp, time_in_force, post_only);
     }
 
     [[nodiscard]] MatchResult match_market_order(const InstrumentId instrument_id,
                                                  const Side aggressor_side,
                                                  const Quantity quantity,
                                                  const OrderId aggressor_id = kInvalidOrderId,
-                                                 const Timestamp timestamp = 0) noexcept
+                                                 const Timestamp timestamp = 0,
+                                                 const ParticipantId participant_id =
+                                                     kAnonymousParticipantId) noexcept
     {
         OrderBook* book = find_book(instrument_id);
         if (book == nullptr) {
             return unknown_result<MatchResult>();
         }
 
-        MatchResult result = book->match_market_order(aggressor_side, quantity, aggressor_id, timestamp);
+        MatchResult result =
+            book->match_market_order(aggressor_side, quantity, aggressor_id, timestamp, participant_id);
         record_event_high_water(result.events_emitted);
         return result;
     }
@@ -210,43 +301,65 @@ public:
     /// with empty event spans. Unknown instruments do not mutate any book.
     [[nodiscard]] DispatchResult dispatch(const Command& command) noexcept
     {
+        return dispatch(VenueCommand{command});
+    }
+
+    /// Dispatch a venue-aware command. Rejected commands do not consume
+    /// order/FIFO or market-data sequence numbers.
+    [[nodiscard]] DispatchResult dispatch(const VenueCommand& venue_command) noexcept
+    {
         ++dispatch_count_;
+        const Command& command = venue_command.command;
         if (!valid_command_op(command.op)) {
             return finish_dispatch(make_dispatch_result(Status::InvalidCommand));
         }
 
         count_dispatch_op(command.op);
-        if (!valid_command(command)) {
+        if (!valid_command(venue_command)) {
             return finish_dispatch(make_dispatch_result(Status::InvalidCommand));
         }
 
         switch (command.op) {
         case CommandOp::Add:
-            return finish_dispatch(to_dispatch_result(add_limit_order(command.instrument_id,
-                                                                      command.order_id,
-                                                                      command.side,
-                                                                      command.price,
-                                                                      command.quantity,
-                                                                      command.timestamp,
-                                                                      command.time_in_force)));
+            return finish_dispatch(with_market_data(
+                command.instrument_id,
+                to_dispatch_result(add_limit_order(command.instrument_id,
+                                                   command.order_id,
+                                                   command.side,
+                                                   command.price,
+                                                   command.quantity,
+                                                   command.timestamp,
+                                                   command.time_in_force,
+                                                   venue_command.participant_id,
+                                                   venue_command.post_only))));
         case CommandOp::Cancel:
-            return finish_dispatch(to_dispatch_result(cancel(command.instrument_id, command.order_id, command.timestamp)));
+            return finish_dispatch(with_market_data(
+                command.instrument_id,
+                to_dispatch_result(cancel(command.instrument_id, command.order_id, command.timestamp))));
         case CommandOp::Modify:
-            return finish_dispatch(
-                to_dispatch_result(modify(command.instrument_id, command.order_id, command.quantity, command.timestamp)));
+            return finish_dispatch(with_market_data(
+                command.instrument_id,
+                to_dispatch_result(
+                    modify(command.instrument_id, command.order_id, command.quantity, command.timestamp))));
         case CommandOp::Replace:
-            return finish_dispatch(to_dispatch_result(replace(command.instrument_id,
-                                                              command.order_id,
-                                                              command.price,
-                                                              command.quantity,
-                                                              command.timestamp,
-                                                              command.time_in_force)));
+            return finish_dispatch(with_market_data(
+                command.instrument_id,
+                to_dispatch_result(replace(command.instrument_id,
+                                           command.order_id,
+                                           command.price,
+                                           command.quantity,
+                                           command.timestamp,
+                                           command.time_in_force,
+                                           venue_command.post_only))));
         case CommandOp::Market:
-            return finish_dispatch(to_dispatch_result(match_market_order(command.instrument_id,
-                                                                         command.side,
-                                                                         command.quantity,
-                                                                         command.order_id,
-                                                                         command.timestamp)));
+            return finish_dispatch(with_market_data(
+                command.instrument_id,
+                to_dispatch_result(match_market_order(command.instrument_id,
+                                                      command.side,
+                                                      command.quantity,
+                                                      command.order_id,
+                                                      command.timestamp,
+                                                      venue_command.participant_id))));
         }
 
         return finish_dispatch(make_dispatch_result(Status::InvalidCommand));
@@ -322,6 +435,20 @@ public:
         return book == nullptr ? std::span<const BookEvent>{} : book->last_events();
     }
 
+    [[nodiscard]] std::span<const MarketDataEvent> last_market_data_events(
+        const InstrumentId instrument_id) const noexcept
+    {
+        const OrderBook* book = find_book(instrument_id);
+        return book == nullptr ? std::span<const MarketDataEvent>{}
+                               : book->last_market_data_events();
+    }
+
+    [[nodiscard]] SequenceNumber market_data_sequence(const InstrumentId instrument_id) const noexcept
+    {
+        const OrderBook* book = find_book(instrument_id);
+        return book == nullptr ? 0 : book->market_data_sequence();
+    }
+
     [[nodiscard]] const OrderBook* order_book(const InstrumentId instrument_id) const noexcept
     {
         return find_book(instrument_id);
@@ -337,9 +464,54 @@ public:
         return instrument_count_;
     }
 
+    /// Canonical checksum of all instruments ordered by instrument id.
+    [[nodiscard]] std::uint64_t state_checksum() const noexcept
+    {
+        constexpr std::uint64_t offset_basis = 14695981039346656037ULL;
+        constexpr std::uint64_t prime = 1099511628211ULL;
+        std::uint64_t hash = offset_basis;
+        const auto append_u64 = [&hash](const std::uint64_t value) noexcept {
+            for (std::uint32_t byte = 0; byte < 8U; ++byte) {
+                hash ^= static_cast<std::uint8_t>((value >> (byte * 8U)) & 0xffU);
+                hash *= prime;
+            }
+        };
+        append_u64(instrument_count_);
+
+        InstrumentId previous = kInvalidInstrumentId;
+        for (std::uint32_t rank = 0; rank < instrument_count_; ++rank) {
+            InstrumentId selected = std::numeric_limits<InstrumentId>::max();
+            const OrderBook* selected_book = nullptr;
+            for (std::uint32_t index = 0; index < instrument_count_; ++index) {
+                const InstrumentId candidate = instruments_[index].config.instrument_id;
+                if (candidate > previous && candidate <= selected) {
+                    selected = candidate;
+                    selected_book = instruments_[index].book.get();
+                }
+            }
+            if (selected_book == nullptr) {
+                break;
+            }
+            append_u64(selected);
+            append_u64(selected_book->state_checksum());
+            previous = selected;
+        }
+        return hash;
+    }
+
     [[nodiscard]] bool valid() const noexcept
     {
         return valid_;
+    }
+
+    [[nodiscard]] MatchingEngineInitError initialization_error() const noexcept
+    {
+        return initialization_error_;
+    }
+
+    [[nodiscard]] std::size_t failed_config_index() const noexcept
+    {
+        return failed_config_index_;
     }
 
     [[nodiscard]] OrderBookStats stats(const InstrumentId instrument_id) const noexcept
@@ -389,6 +561,11 @@ public:
     }
 
 private:
+    struct InitializationDiagnostic final {
+        MatchingEngineInitError error{MatchingEngineInitError::None};
+        std::size_t config_index{kInvalidInstrumentConfigIndex};
+    };
+
     struct InstrumentState final {
         InstrumentConfig config{};
         std::unique_ptr<OrderBook> book{};
@@ -416,6 +593,8 @@ private:
     std::array<std::uint64_t, kStatusCount> rejects_by_status_{};
     std::uint32_t event_log_high_water_mark_{0};
     std::uint64_t decode_errors_{0};
+    MatchingEngineInitError initialization_error_{MatchingEngineInitError::None};
+    std::size_t failed_config_index_{kInvalidInstrumentConfigIndex};
 
     [[nodiscard]] static DispatchResult make_dispatch_result(const Status status) noexcept
     {
@@ -490,6 +669,20 @@ private:
         result.last_price = source.last_price;
         result.events_emitted = source.events_emitted;
         result.events = source.events;
+        result.aggressor_cancelled_by_stp = source.aggressor_cancelled_by_stp;
+        result.resting_orders_cancelled_by_stp = source.resting_orders_cancelled_by_stp;
+        return result;
+    }
+
+    [[nodiscard]] DispatchResult with_market_data(const InstrumentId instrument_id,
+                                                  DispatchResult result) const noexcept
+    {
+        const OrderBook* const book = find_book(instrument_id);
+        if (book != nullptr) {
+            result.market_data_events = book->last_market_data_events();
+            result.market_data_events_emitted =
+                static_cast<std::uint32_t>(result.market_data_events.size());
+        }
         return result;
     }
 
@@ -565,6 +758,17 @@ private:
         case Status::SnapshotCapacityExceeded:
         case Status::InvalidCommand:
         case Status::EventLogFull:
+        case Status::LotSizeViolation:
+        case Status::PostOnlyWouldCross:
+        case Status::InvalidPostOnlyTimeInForce:
+        case Status::SelfTradePrevented:
+        case Status::MarketDataLogFull:
+        case Status::JournalFormatMismatch:
+        case Status::JournalVersionMismatch:
+        case Status::JournalLengthMismatch:
+        case Status::JournalChecksumMismatch:
+        case Status::JournalInvalidField:
+        case Status::ReplayDiverged:
             return true;
         }
 
@@ -586,22 +790,104 @@ private:
         return instruments_[index].book.get();
     }
 
-    [[nodiscard]] bool insert_instrument(const InstrumentConfig& config)
+    [[nodiscard]] static InitializationDiagnostic validate_configurations(
+        const std::uint32_t max_instruments,
+        const std::span<const InstrumentConfig> configs) noexcept
     {
-        if (instrument_count_ >= max_instruments_ || config.instrument_id == kInvalidInstrumentId ||
-            !config.book_config.valid()) {
-            return false;
+        if (configs.size() > static_cast<std::size_t>(max_instruments)) {
+            return InitializationDiagnostic{
+                MatchingEngineInitError::InstrumentCapacityExceeded,
+                static_cast<std::size_t>(max_instruments),
+            };
+        }
+
+        for (std::size_t index = 0; index < configs.size(); ++index) {
+            const InstrumentConfig& config = configs[index];
+            if (config.instrument_id == kInvalidInstrumentId) {
+                return InitializationDiagnostic{
+                    MatchingEngineInitError::InvalidInstrumentId,
+                    index,
+                };
+            }
+            if (!config.book_config.valid()) {
+                return InitializationDiagnostic{
+                    MatchingEngineInitError::InvalidBookConfiguration,
+                    index,
+                };
+            }
+            if (config.self_trade_policy > SelfTradePolicy::CancelBoth) {
+                return InitializationDiagnostic{
+                    MatchingEngineInitError::InvalidBookConfiguration,
+                    index,
+                };
+            }
+
+            for (std::size_t prior = 0; prior < index; ++prior) {
+                if (configs[prior].instrument_id == config.instrument_id) {
+                    return InitializationDiagnostic{
+                        MatchingEngineInitError::DuplicateInstrumentId,
+                        index,
+                    };
+                }
+            }
+        }
+
+        return {};
+    }
+
+    void fail_initialization(const MatchingEngineInitError error,
+                             const std::size_t config_index) noexcept
+    {
+        instruments_.reset();
+        lookup_.reset();
+        instrument_count_ = 0;
+        lookup_capacity_ = 0;
+        valid_ = false;
+        initialization_error_ = error;
+        failed_config_index_ = config_index;
+    }
+
+    [[nodiscard]] MatchingEngineInitError insert_instrument(
+        const InstrumentConfig& config)
+    {
+        if (instrument_count_ >= max_instruments_) {
+            return MatchingEngineInitError::InstrumentCapacityExceeded;
+        }
+        if (config.instrument_id == kInvalidInstrumentId) {
+            return MatchingEngineInitError::InvalidInstrumentId;
+        }
+        if (!config.book_config.valid()) {
+            return MatchingEngineInitError::InvalidBookConfiguration;
         }
 
         bool duplicate = false;
         const std::uint32_t slot = lookup_insert_slot(config.instrument_id, duplicate);
-        if (slot == kInvalidIndex || duplicate) {
-            return false;
+        if (duplicate) {
+            return MatchingEngineInitError::DuplicateInstrumentId;
+        }
+        if (slot == kInvalidIndex) {
+            return MatchingEngineInitError::InternalInsertionFailure;
         }
 
         InstrumentConfig stored = config;
         if (stored.tick_size == 0) {
             stored.tick_size = stored.book_config.tick_size;
+        }
+        if (stored.lot_size != 0) {
+            stored.book_config.lot_size = stored.lot_size;
+        } else {
+            stored.lot_size = stored.book_config.lot_size;
+        }
+        if (stored.self_trade_policy != SelfTradePolicy::Disabled ||
+            stored.book_config.self_trade_policy == SelfTradePolicy::Disabled) {
+            stored.book_config.self_trade_policy = stored.self_trade_policy;
+        } else {
+            stored.self_trade_policy = stored.book_config.self_trade_policy;
+        }
+        if (stored.market_data_capacity != 0) {
+            stored.book_config.market_data_capacity = stored.market_data_capacity;
+        } else {
+            stored.market_data_capacity = stored.book_config.market_data_capacity;
         }
 
         const std::uint32_t index = instrument_count_;
@@ -612,7 +898,7 @@ private:
         lookup_[slot].instrument_index = index;
         lookup_[slot].occupied = true;
         ++instrument_count_;
-        return true;
+        return MatchingEngineInitError::None;
     }
 
     [[nodiscard]] std::uint32_t lookup_index(const InstrumentId instrument_id) const noexcept
@@ -712,6 +998,80 @@ private:
         return result;
     }
 };
+
+struct MatchingEngineCreateResult final {
+    MatchingEngineInitError error{MatchingEngineInitError::None};
+    std::size_t config_index{kInvalidInstrumentConfigIndex};
+    std::unique_ptr<MatchingEngine> engine{};
+
+    [[nodiscard]] bool has_value() const noexcept
+    {
+        return engine != nullptr;
+    }
+
+    [[nodiscard]] explicit operator bool() const noexcept
+    {
+        return has_value();
+    }
+
+    [[nodiscard]] MatchingEngine* get() noexcept
+    {
+        return engine.get();
+    }
+
+    [[nodiscard]] const MatchingEngine* get() const noexcept
+    {
+        return engine.get();
+    }
+};
+
+template <std::size_t N>
+MatchingEngineCreateResult MatchingEngine::create(
+    const InstrumentConfig (&configs)[N]) noexcept
+{
+    return create(span_size_to_u32(N), std::span<const InstrumentConfig, N>(configs));
+}
+
+template <std::size_t N>
+MatchingEngineCreateResult MatchingEngine::create(
+    const std::uint32_t max_instruments,
+    const InstrumentConfig (&configs)[N]) noexcept
+{
+    return create(max_instruments, std::span<const InstrumentConfig, N>(configs));
+}
+
+inline MatchingEngineCreateResult MatchingEngine::create(
+    const std::span<const InstrumentConfig> configs) noexcept
+{
+    return create(span_size_to_u32(configs.size()), configs);
+}
+
+inline MatchingEngineCreateResult MatchingEngine::create(
+    const std::uint32_t max_instruments,
+    const std::span<const InstrumentConfig> configs) noexcept
+{
+    try {
+        std::unique_ptr<MatchingEngine> engine =
+            std::make_unique<MatchingEngine>(max_instruments, configs);
+        if (!engine->valid()) {
+            const MatchingEngineInitError error = engine->initialization_error();
+            const std::size_t config_index = engine->failed_config_index();
+            return MatchingEngineCreateResult{error, config_index, nullptr};
+        }
+
+        return MatchingEngineCreateResult{
+            MatchingEngineInitError::None,
+            kInvalidInstrumentConfigIndex,
+            std::move(engine),
+        };
+    } catch (const std::bad_alloc&) {
+        return MatchingEngineCreateResult{
+            MatchingEngineInitError::AllocationFailure,
+            kInvalidInstrumentConfigIndex,
+            nullptr,
+        };
+    }
+}
 
 static_assert(alignof(MatchingEngine) >= 64);
 
