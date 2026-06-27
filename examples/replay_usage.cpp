@@ -91,8 +91,10 @@ int main()
         InstrumentConfig{instrument_b, config},
     };
 
-    MatchingEngine engine(instruments);
-    require(engine.valid(), "engine configuration rejected");
+    MatchingEngineCreateResult engine_result =
+        MatchingEngine::create(instruments);
+    require(engine_result.has_value(), "engine configuration rejected");
+    MatchingEngine& engine = *engine_result.engine;
 
     constexpr std::array<Command, 12> commands{{
         Command{instrument_a, CommandOp::Add, 1, Side::Buy, 100, 10, TimeInForce::Gtc, 1},

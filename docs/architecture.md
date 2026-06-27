@@ -229,10 +229,40 @@ with the original order still resting.
 ## Multi-Instrument Engine
 
 `MatchingEngine` is a routing layer over independent `OrderBook` instances. It
-is configured with a fixed `max_instruments` and `InstrumentConfig` array at
-construction. Each `InstrumentConfig` contains an `InstrumentId`, a `BookConfig`,
-and optional tick/lot metadata fields for callers that want to carry venue or
-symbol metadata beside the book configuration.
+is configured with a fixed `max_instruments` and `InstrumentConfig` array. Each
+`InstrumentConfig` contains an `InstrumentId`, a `BookConfig`, and optional
+tick/lot metadata fields for callers that want to carry venue or symbol
+metadata beside the book configuration.
+
+`MatchingEngine::create(...)` is the primary construction API. Its
+`MatchingEngineCreateResult` owns a non-null engine only on complete success.
+On failure, `error` contains one of:
+
+- `InstrumentCapacityExceeded`
+- `InvalidInstrumentId`
+- `InvalidBookConfiguration`
+- `DuplicateInstrumentId`
+- `AllocationFailure`
+- `InternalInsertionFailure`
+
+`config_index` identifies the first failing entry, or is
+`kInvalidInstrumentConfigIndex` when no entry is responsible. Empty
+configuration is explicitly supported as a valid zero-instrument engine.
+
+Initialization first validates the complete configuration, including a bounded
+cold-path duplicate-id scan, before allocating instrument arrays or
+constructing any `OrderBook`. It then builds the fixed routing state. If that
+second phase fails, all constructed books and lookup entries are destroyed.
+The `noexcept` factory catches allocation failure and returns it explicitly, so
+it never exposes a partial engine.
+
+Direct constructors remain for source compatibility. A configuration failure
+leaves such an instance strictly fail closed: `valid()` is false,
+`instrument_count()` is zero, `initialization_error()` and
+`failed_config_index()` retain the diagnostic, and no instrument can be found.
+Commands targeting it therefore return `Status::UnknownInstrument`; read
+surfaces return their documented empty values, and engine snapshot
+serialization returns `Status::InvalidConfiguration`.
 
 Construction allocates:
 
@@ -244,6 +274,7 @@ No instruments are inserted or erased on the hot path, so routing does not grow
 containers after construction. Lookup is O(1) average and bounded by the fixed
 lookup-table capacity. Unknown instruments return `Status::UnknownInstrument`
 from mutating APIs and do not emit events or touch any configured book.
+Valid-engine routing contains no initialization-validity branch.
 
 Order ids are scoped per instrument because each instrument owns its own
 `OrderBook` and `OrderIdMap`. The same `OrderId` can rest simultaneously on two
@@ -333,18 +364,55 @@ sequences, and FIFO records whose arrival sequences move backward at one price.
 These checks run before the destination is cleared, so malformed snapshots
 return an explicit status without changing the preconfigured book.
 
+Let `n` be the serialized order count and `l` the serialized occupied-level
+count. The previous validator scanned all preceding orders for every order,
+scanned all preceding levels and all orders for every level, then scanned all
+levels for every order. Its validation cost was
+`O(n² + n*l + l²)`, which is `O(n²)` for valid snapshots because `l <= n`.
+
+Current validation uses the target book's preallocated
+`SnapshotValidationWorkspace`:
+
+1. Stable eight-pass radix sorts detect duplicate 64-bit order IDs and
+   duplicate non-saturated 64-bit arrival sequences.
+2. A stable radix sort groups orders by `(side, price index)`, verifies FIFO
+   sequence order, and computes checked quantity and order-count aggregates.
+3. A radix sort of serialized levels detects duplicate levels and permits one
+   linear comparison against the order-derived aggregates.
+4. A final stable radix sort records the restore order by side and ascending
+   price. FIFO order within a level is retained, and sparse storage can append
+   new sorted price slots without repeated shifts.
+
+The radix key width and digit table are fixed, so validation is
+`O(n + l)` deterministic work rather than an expected hash-table bound. No
+allocation-backed associative container is used.
+
+Each constructed `OrderBook` reserves three 24-byte workspace records per
+configured order slot: `72 * config.max_orders` bytes of heap storage, plus a
+1 KiB radix counter table and small pointer/counter fields in the book object.
+The workspace is allocated once during construction and reused by every
+restore. It does not change the snapshot wire format or public restore API.
+
+Validation is linear in snapshot occupancy, but a complete restore also clears
+fixed-capacity destination storage and rebuilds its fixed hash maps. Dense clear
+work is bounded by configured order slots, id-map capacity, and the configured
+price-level range. Sparse clear work is bounded by configured order slots and
+sparse map capacity. Hash probes during rebuild remain bounded by those fixed
+map capacities. Thus restore is a configured-capacity-bounded control-plane
+operation; it is not part of the matching hot path.
+
 Snapshots are not matching hot-path operations. They are intended for recovery,
 replay checkpoints, and deterministic test or simulator handoff. The
 implementation performs no heap allocation during serialize or restore after the
 target `OrderBook` or `MatchingEngine` has been constructed; restore rebuilds
 through the existing fixed `MemoryPool`, flat price levels, and fixed id map.
 
-Book snapshot format version `2` is a little-endian byte stream:
+Book snapshot format version `3` is a little-endian byte stream:
 
 ```text
 BookSnapshot
   magic: "EBOK"
-  version: u8 = 2
+  version: u8 = 3
   reserved: 3 bytes = 0
   instrument_id: u32
   BookConfig:
@@ -355,10 +423,14 @@ BookSnapshot
     tick_size: i64 bits
     event_log_capacity: u32
     price_level_mode: u8
+    lot_size: u64
+    self_trade_policy: u8
+    market_data_capacity: u32
   live_order_count: u32
   level_aggregate_count: u32
   next_sequence: u64
   event_next_sequence: u64
+  market_data_sequence: u64
   live orders, in deterministic book/FIFO order:
     id: u64
     side: u8
@@ -366,6 +438,8 @@ BookSnapshot
     quantity: u64
     timestamp: u64
     sequence: u64
+    participant_id: u64
+    post_only: u8
   level aggregates:
     side: u8
     price: i64 bits
@@ -376,7 +450,8 @@ BookSnapshot
 `next_sequence` is the next resting-order sequence state owned by `OrderBook`.
 `event_next_sequence` is also stored so event sequence numbers continue
 deterministically after restore. Restore itself emits no events and clears
-`last_events()`.
+`last_events()`. `market_data_sequence` provides the consumer checkpoint and
+the next incremental event continues at that value plus one.
 
 The maximum live orders in a book snapshot is the book's normalized
 `config.max_orders`, and the order count must also fit the normalized fixed
@@ -384,14 +459,22 @@ The maximum live orders in a book snapshot is the book's normalized
 `2 * config.price_level_count()` in dense mode, because each side can occupy
 each configured price at most once. In sparse mode it is bounded by
 `2 * config.max_orders`, matching the fixed sparse level storage. Restore
-rejects snapshots whose order or level counts exceed those limits.
+rejects snapshots whose order or level counts exceed those limits. Since every
+serialized level must have at least one matching order, accepted snapshots also
+require `level_count <= order_count`.
+
+Intrusive pointers, pool indices, occupancy words, cached best prices, and
+sparse-map slots are intentionally not serialized. Restore reconstructs them
+from validated order and level records; aggregate, uniqueness, crossed-book,
+and FIFO checks prevent corrupt logical records from producing inconsistent
+derived metadata.
 
 Engine snapshots wrap a fixed-capacity array of instrument snapshots:
 
 ```text
 EngineSnapshot
   magic: "EBEN"
-  version: u8 = 2
+  version: u8 = 3
   reserved: 3 bytes = 0
   max_instruments: u32
   instrument_count: u32
@@ -406,6 +489,9 @@ Engine restore requires the target engine to be constructed with the same
 `max_instruments`, instrument count, instrument order, and instrument
 configuration. This keeps restore allocation-free and preserves the fixed
 instrument lookup topology.
+
+The complete versioning and journal binary contracts are specified in
+[`market-data-and-recovery.md`](market-data-and-recovery.md).
 
 ## Market Depth
 
@@ -501,6 +587,44 @@ original order timestamp and arrival sequence. Lose-priority replacements use
 the replacement call timestamp for emitted events and, if a GTC residual rests,
 store that timestamp on the new resting order with a fresh internal arrival
 sequence.
+
+## Enforced Zero-Allocation Boundary
+
+After the relevant `OrderBook`, `MatchingEngine`, fixed-capacity component, and
+caller-owned command/result storage have been constructed and warmed, the
+automated allocation guard defines the matching hot path as:
+
+- dense and sparse resting limit insertion, full/partial limit matching, market
+  matching, cancellation by order id, quantity reduction, and replacement;
+- dense and sparse IOC no-liquidity, partial-fill, and full-fill paths;
+- dense and sparse FOK rejection and full execution;
+- fixed-capacity order and trade event emission, including ring wrap;
+- lot-size, post-only, and participant-aware STP paths;
+- fixed-capacity incremental market-data emission and capacity rejection;
+- bounded journal-record production and replay verification;
+- `MatchingEngine::dispatch(const Command&)` and encoded-command decode plus
+  dispatch across dense and sparse instruments;
+- successful repeated command sequences and explicit rejection at order-pool,
+  order-id-map, sparse price-level, event-log, and market-data capacity.
+
+All command bytes, expected statuses, and result storage exist before tracking.
+The measured region contains only the operation or repeated operation sequence.
+Allocation counting is disabled before assertions, diagnostics, state
+inspection, or test output.
+
+Construction, destruction, factory initialization, depth/top-of-book queries,
+statistics, Python bindings, examples, benchmarks, and external persistence are
+outside this enforced hot-path boundary. Snapshot serialization uses
+caller-owned storage; restore and journal replay are separately covered by the
+allocation guard after target construction.
+
+The test-only tracker replaces the C++20 global scalar and array `operator new`
+forms, including aligned and nothrow overloads. It preserves over-alignment,
+uses `std::new_handler` for throwing forms, throws `std::bad_alloc` on terminal
+failure, and returns null from nothrow forms. It counts calls routed through
+those C++ allocation functions while enabled. It does not intercept direct
+`malloc`, `calloc`, `realloc`, third-party C allocators, OS allocation APIs, or
+allocator implementations that bypass replaceable global `operator new`.
 
 ## Why Tree Maps Are Avoided
 

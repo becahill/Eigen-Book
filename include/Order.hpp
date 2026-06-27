@@ -13,11 +13,13 @@ struct alignas(64) Order final {
     Quantity initial_quantity{0};
     Timestamp timestamp{0};
     SequenceNumber sequence{0};
+    ParticipantId participant_id{kAnonymousParticipantId};
     Side side{Side::Buy};
     OrderState state{OrderState::Inactive};
     Order* prev{nullptr};
     Order* next{nullptr};
     PriceLevel* level{nullptr};
+    bool post_only{false};
     bool active{false};
 
     Order() noexcept = default;
@@ -27,7 +29,9 @@ struct alignas(64) Order final {
                const Price new_price,
                const Quantity new_quantity,
                const Timestamp new_timestamp = 0,
-               const SequenceNumber new_sequence = 0) noexcept
+               const SequenceNumber new_sequence = 0,
+               const ParticipantId new_participant_id = kAnonymousParticipantId,
+               const bool new_post_only = false) noexcept
     {
         id = new_id;
         side = new_side;
@@ -36,10 +40,12 @@ struct alignas(64) Order final {
         initial_quantity = new_quantity;
         timestamp = new_timestamp;
         sequence = new_sequence;
+        participant_id = new_participant_id;
         state = OrderState::Resting;
         prev = nullptr;
         next = nullptr;
         level = nullptr;
+        post_only = new_post_only;
         active = true;
     }
 
@@ -51,11 +57,13 @@ struct alignas(64) Order final {
         initial_quantity = 0;
         timestamp = 0;
         sequence = 0;
+        participant_id = kAnonymousParticipantId;
         side = Side::Buy;
         state = OrderState::Inactive;
         prev = nullptr;
         next = nullptr;
         level = nullptr;
+        post_only = false;
         active = false;
     }
 

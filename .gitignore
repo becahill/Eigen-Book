@@ -8,4 +8,23 @@ cmake-build-*/
 *.so
 *.dSYM/
 
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Python packaging output and metadata
+dist/
+wheelhouse/
+*.egg-info/
+*.whl
+
+# Test and analysis caches
+.pytest_cache/
+.coverage
+htmlcov/
+
 .DS_Store
