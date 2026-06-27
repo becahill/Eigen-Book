@@ -18,7 +18,7 @@ option(EIGENBOOK_ENABLE_ASAN "Enable AddressSanitizer on supported compilers" OF
 option(EIGENBOOK_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer on supported compilers" OFF)
 option(EIGENBOOK_ENABLE_CLANG_TIDY
     "Run focused clang-tidy checks over Eigen-Book production headers" OFF)
-set(EIGENBOOK_CLANG_TIDY_EXECUTABLE "clang-tidy" CACHE FILEPATH
+set(EIGENBOOK_CLANG_TIDY_EXECUTABLE "clang-tidy" CACHE STRING
     "clang-tidy executable used when EIGENBOOK_ENABLE_CLANG_TIDY is ON")
 set(EIGENBOOK_BENCHMARK_OPERATIONS "50000" CACHE STRING
     "Operations per workload in the run_benchmarks target")
