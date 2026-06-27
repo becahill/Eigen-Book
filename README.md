@@ -405,6 +405,8 @@ NumPy is the only core runtime dependency: it provides the fixed-layout event
 and depth buffers. Gymnasium is optional. The extras have narrow purposes:
 
 - `eigenbook[rl]` installs Gymnasium for `eigenbook.env`.
+- `eigenbook[training]` installs compatible Gymnasium, Stable-Baselines3, and
+  transitive PyTorch versions for the PPO demonstration pipeline.
 - `eigenbook[benchmark]` installs Gymnasium for the Python environment
   benchmark.
 - `eigenbook[test]` installs pytest for the Python correctness suite.
@@ -489,9 +491,84 @@ mappings before retaining them.
 Importing `eigenbook` does not import Gymnasium. Accessing the environment
 without the extra raises an error containing the exact installation command.
 
+### PPO Demonstration Pipeline
+
+The repository includes a Stable-Baselines3 PPO demonstration in
+`scripts/train_ppo.py`. Install the dedicated optional dependencies from a
+checkout, then run the default 100,000-requested-timestep workload:
+
+```sh
+python -m pip install '.[training]'
+python scripts/train_ppo.py
+```
+
+The training extra constrains Gymnasium to `>=1.2,<1.4` and
+Stable-Baselines3 to `>=2.9,<3`; Stable-Baselines3 supplies its compatible
+PyTorch dependency.
+
+Generated models default to `training-output/ppo_eigenbook_agent.zip`. The
+directory and conventional `ppo_*.zip` model names are ignored by Git. An
+existing output file is replaced. A shorter development run is:
+
+```sh
+python scripts/train_ppo.py \
+  --training-timesteps 4096 \
+  --evaluation-steps 250 \
+  --seed 23 \
+  --ppo-rollout-steps 512 \
+  --ppo-batch-size 64 \
+  --model-output training-output/ppo_development_agent \
+  --verbose
+```
+
+The CLI accepts:
+
+- `--training-timesteps`: positive requested learning horizon. PPO finishes
+  its current rollout, so the actual learned timestep count can be higher.
+- `--evaluation-steps`: positive maximum length of the single deterministic
+  evaluation episode.
+- `--seed`: integer from 0 through 2^32 - 1.
+- `--ppo-rollout-steps`: samples collected before each PPO update.
+- `--ppo-batch-size`: minibatch size. It must not exceed, and must evenly
+  divide, the rollout size.
+- `--model-output`: output archive path; `.zip` is appended when absent.
+- `--quiet`: suppress routine output.
+- `--verbose`: include Stable-Baselines3 training metrics. The default mode
+  prints only pipeline progress and the result summary.
+
+Use `python scripts/train_ppo.py --help` for defaults and validation details.
+A successful normal-mode run validates the Gymnasium API, trains the model,
+saves and reloads the archive, and prints deterministic evaluation reward,
+step count, and termination state. The pipeline uses Gymnasium's standard
+flatten-observation wrapper for PPO without changing `LimitOrderBookEnv`'s
+public `(2, 5, 2)` observation API.
+
+```text
+[setup] Using deterministic seed 7 on CPU.
+[validation] Checking the Gymnasium environment.
+[training] Requesting 100,000 PPO timesteps.
+...
+[persistence] Saved model to .../ppo_eigenbook_agent.zip.
+[persistence] Reloaded model; evaluating up to 1,000 steps.
+[results] reward=..., steps=..., terminated=..., truncated=...
+```
+
+The seed is applied to Python, NumPy, Gymnasium spaces and resets,
+Stable-Baselines3, and Torch. Training is forced onto CPU and Torch
+deterministic algorithms are enabled. Identical results are still not
+guaranteed across operating systems, processors, BLAS implementations, Torch
+versions, or Stable-Baselines3 versions. Record the seed, dependency versions,
+and hardware when comparing experiments.
+
+This agent is a software integration demonstration, not a validated trading
+strategy. Its synthetic environment has no historical order flow, fees,
+latency, market impact, or out-of-sample profitability assessment. Evaluation
+reward demonstrates deterministic execution of this toy objective; it is not
+evidence of trading performance.
+
 ### Python Tests And Wheel Validation
 
-Run core and RL tests from an installed package:
+Run core, RL, and PPO training tests from an installed package:
 
 ```sh
 python -m pip install '.[test]'
@@ -500,6 +577,9 @@ python -m pytest tests/test_python_bindings.py \
 
 python -m pip install '.[rl]'
 python -m pytest tests/test_eigenbook_env.py
+
+python -m pip install '.[training,test]'
+python -m pytest tests/test_train_ppo.py
 ```
 
 Build a local wheel with `python -m build --wheel`. CI installs that wheel into
@@ -551,9 +631,10 @@ Release, and combined ASAN/UBSAN builds, runs deterministic tests under the
 sanitizers, explicitly runs the zero-allocation hot-path guard in Debug and
 Release, and compiles the benchmark target without running benchmark timing in
 CI. Installed core-package tests cover CPython 3.10 through 3.14 without
-Gymnasium; separate jobs install the RL extra and build/install a wheel in a
-clean environment. No job publishes packages. Separate Clang 18 jobs run
-focused static analysis and fixed-run libFuzzer smoke tests, preserving any
-failing fuzz artifact. The guarded boundary and tracker limitations are
-documented in
+Gymnasium; separate jobs install the RL extra, run a Python 3.12 PPO
+train-save-load-evaluate smoke cycle entirely under the runner temporary
+directory, and build/install a wheel in a clean environment. No job publishes
+packages. Separate Clang 18 jobs run focused static analysis and fixed-run
+libFuzzer smoke tests, preserving any failing fuzz artifact. The guarded
+boundary and tracker limitations are documented in
 [`docs/architecture.md`](docs/architecture.md#enforced-zero-allocation-boundary).

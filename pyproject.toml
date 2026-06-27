@@ -37,6 +37,10 @@ dependencies = [
 rl = [
     "gymnasium>=1.0,<2",
 ]
+training = [
+    "gymnasium>=1.2,<1.4",
+    "stable-baselines3>=2.9,<3",
+]
 benchmark = [
     "gymnasium>=1.0,<2",
 ]
@@ -76,4 +80,5 @@ __version__ = "${version}"
 addopts = "-ra"
 markers = [
     "rl: requires the optional Gymnasium dependency",
+    "training: requires the optional Stable-Baselines3 training dependencies",
 ]

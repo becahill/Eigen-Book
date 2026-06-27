@@ -27,4 +27,8 @@ wheelhouse/
 .coverage
 htmlcov/
 
+# PPO training artifacts
+training-output/
+ppo_*.zip
+
 .DS_Store

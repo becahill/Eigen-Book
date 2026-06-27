@@ -111,6 +111,45 @@ jobs:
           python -m pytest
           "${{ github.workspace }}/tests/test_eigenbook_env.py"
 
+  python-training:
+    name: Python 3.12 PPO training smoke
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install package with training and test extras
+        run: python -m pip install '.[training,test]'
+
+      - name: Test PPO training utilities
+        working-directory: ${{ runner.temp }}
+        run: >
+          python -m pytest
+          --basetemp "${{ runner.temp }}/eigenbook-ppo-pytest"
+          "${{ github.workspace }}/tests/test_train_ppo.py"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+
+      - name: Run train-save-load-evaluate smoke cycle
+        working-directory: ${{ runner.temp }}
+        run: >
+          python "${{ github.workspace }}/scripts/train_ppo.py"
+          --training-timesteps 8
+          --evaluation-steps 4
+          --seed 7
+          --ppo-rollout-steps 8
+          --ppo-batch-size 4
+          --model-output "${{ runner.temp }}/eigenbook-ppo-smoke/agent"
+          --quiet
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+
   python-wheel:
     name: Build and install wheel
     runs-on: ubuntu-latest
