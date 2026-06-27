@@ -318,7 +318,18 @@ void bind_enums(py::module_& module)
         .value("SNAPSHOT_CONFIGURATION_MISMATCH", Status::SnapshotConfigurationMismatch)
         .value("SNAPSHOT_CAPACITY_EXCEEDED", Status::SnapshotCapacityExceeded)
         .value("INVALID_COMMAND", Status::InvalidCommand)
-        .value("EVENT_LOG_FULL", Status::EventLogFull);
+        .value("EVENT_LOG_FULL", Status::EventLogFull)
+        .value("LOT_SIZE_VIOLATION", Status::LotSizeViolation)
+        .value("POST_ONLY_WOULD_CROSS", Status::PostOnlyWouldCross)
+        .value("INVALID_POST_ONLY_TIME_IN_FORCE", Status::InvalidPostOnlyTimeInForce)
+        .value("SELF_TRADE_PREVENTED", Status::SelfTradePrevented)
+        .value("MARKET_DATA_LOG_FULL", Status::MarketDataLogFull)
+        .value("JOURNAL_FORMAT_MISMATCH", Status::JournalFormatMismatch)
+        .value("JOURNAL_VERSION_MISMATCH", Status::JournalVersionMismatch)
+        .value("JOURNAL_LENGTH_MISMATCH", Status::JournalLengthMismatch)
+        .value("JOURNAL_CHECKSUM_MISMATCH", Status::JournalChecksumMismatch)
+        .value("JOURNAL_INVALID_FIELD", Status::JournalInvalidField)
+        .value("REPLAY_DIVERGED", Status::ReplayDiverged);
 }
 
 void bind_configuration(py::module_& module)

@@ -25,6 +25,7 @@ def make_instrument(
     *,
     instrument_id: int = 101,
     book_config: eb.BookConfig | None = None,
+    lot_size: int = 1,
 ) -> eb.InstrumentConfig:
     config = eb.InstrumentConfig()
     config.instrument_id = instrument_id
@@ -32,7 +33,7 @@ def make_instrument(
         book_config if book_config is not None else make_book_config()
     )
     config.tick_size = 1
-    config.lot_size = 1
+    config.lot_size = lot_size
     return config
 
 

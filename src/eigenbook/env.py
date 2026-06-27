@@ -53,7 +53,8 @@ class LimitOrderBookEnv(gym.Env[np.ndarray, np.ndarray]):
 
     Actions are ``[side, price_offset, quantity]``. Side is 0 for buy and 1 for
     sell. Price offsets are centered on the middle configured price level.
-    Quantity code zero submits one native quantity unit.
+    Quantity code zero submits one configured lot. With lot-size enforcement
+    disabled, one lot is one native quantity unit.
 
     Reward is ``executed_quantity - residual_quantity``. Inventory counts only
     the submitted order's aggressive executions: buy fills add inventory and
@@ -124,6 +125,11 @@ class LimitOrderBookEnv(gym.Env[np.ndarray, np.ndarray]):
         self.max_abs_inventory = (
             None if max_abs_inventory is None else int(max_abs_inventory)
         )
+        self._quantity_step = max(1, int(self.instrument_config.lot_size))
+        if self.max_order_quantity * self._quantity_step > uint64_max:
+            raise ValueError(
+                "max_order_quantity and lot_size exceed native uint64 capacity"
+            )
 
         book_config = self.instrument_config.book_config
         self._engine_configs = (self.instrument_config,)
@@ -320,7 +326,7 @@ class LimitOrderBookEnv(gym.Env[np.ndarray, np.ndarray]):
 
         side_index, offset_code, quantity_code = self._decode_action(action)
         offset_ticks = offset_code - self.max_price_offset_ticks
-        quantity = quantity_code + 1
+        quantity = (quantity_code + 1) * self._quantity_step
 
         command = self._command
         command.order_id = self._next_order_id

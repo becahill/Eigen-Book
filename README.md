@@ -475,7 +475,9 @@ observation, reward, terminated, truncated, info = env.step(
 
 Actions are `[side, centered_price_offset, quantity_code]`. Observations are a
 reused `(2, 5, 2)` float32 bid/ask depth buffer. Reward is aggressive executed
-quantity minus residual quantity. Inventory counts aggressive buy fills
+quantity minus residual quantity. Quantity code `n` submits `n + 1` configured
+lots; when lot-size enforcement is disabled, one lot is one quantity unit.
+Inventory counts aggressive buy fills
 positively and sell fills negatively; previously resting actions are treated
 as book liquidity for this accounting. The inventory boundary terminates an
 episode and the step limit truncates it. Calling `step` before `reset` or after

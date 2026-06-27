@@ -127,6 +127,21 @@ def test_native_rejections_are_exposed_as_status_values() -> None:
         engine.event_buffer_capacity(999)
 
 
+def test_lot_size_rejection_has_a_named_status() -> None:
+    engine = eb.MatchingEngine([make_instrument(lot_size=5)])
+    result = engine.dispatch(
+        make_add_command(
+            order_id=1,
+            side=eb.Side.BUY,
+            price=100,
+            quantity=1,
+        )
+    )
+
+    assert result.status == eb.Status.LOT_SIZE_VIOLATION
+    assert result.events_emitted == 1
+
+
 def test_default_event_capacity_is_reported_by_native_engine() -> None:
     book = make_book_config(max_orders=16, event_log_capacity=0)
     engine = eb.MatchingEngine([make_instrument(book_config=book)])

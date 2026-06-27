@@ -202,6 +202,30 @@ def test_invalid_environment_configuration_is_explicit() -> None:
         LimitOrderBookEnv(instrument, max_abs_inventory=1.5)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="outside the configured book"):
         LimitOrderBookEnv(instrument, max_price_offset_ticks=11)
+    oversized_lots = make_instrument(
+        book_config=make_book_config(max_orders=8),
+        lot_size=int(np.iinfo(np.uint64).max),
+    )
+    with pytest.raises(ValueError, match="uint64 capacity"):
+        LimitOrderBookEnv(oversized_lots, max_order_quantity=2)
+
+
+def test_quantities_scale_by_configured_lot_size() -> None:
+    book = make_book_config(max_orders=8, event_log_capacity=10)
+    env = LimitOrderBookEnv(
+        make_instrument(book_config=book, lot_size=5),
+        max_price_offset_ticks=10,
+        max_order_quantity=3,
+    )
+    observation, _ = env.reset(seed=1)
+
+    _, reward, _, _, info = env.step(np.array([1, 10, 2], dtype=np.int64))
+
+    assert reward == -15.0
+    assert info["status"] == eb.Status.ACCEPTED
+    assert info["residual_quantity"] == 15
+    assert info["resting_quantity"] == 15
+    assert observation[1, 0, 1] == 15
 
 
 def test_multiple_environments_are_independent() -> None:
