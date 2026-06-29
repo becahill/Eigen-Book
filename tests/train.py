@@ -1,5 +1,6 @@
 """Train and evaluate a PPO agent on the Eigen-Book Gymnasium environment."""
 
+import random
 from pathlib import Path
 
 import gymnasium as gym
@@ -71,6 +72,48 @@ class OrderBookFeaturesWrapper(gym.ObservationWrapper):
         )
 
 
+class NoiseTraderWrapper(gym.Wrapper):
+    """Inject random aggressive IOC orders after agent actions."""
+
+    def __init__(self, env, noise_prob=0.15):
+        super().__init__(env)
+        self.noise_prob = noise_prob
+        self._next_noise_order_id = 1_000_000_000
+        self._next_noise_timestamp = 1_000_000_000
+        self._noise_command = eigenbook.Command()
+        self._noise_command.instrument_id = self.env.unwrapped.instrument_id
+        self._noise_command.op = eigenbook.CommandOp.ADD
+        self._noise_command.time_in_force = eigenbook.TimeInForce.IOC
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+
+        if random.random() < self.noise_prob and not (terminated or truncated):
+            native_env = self.env.unwrapped
+            side = random.choice((eigenbook.Side.BUY, eigenbook.Side.SELL))
+            quantity = random.randint(1, 5)
+
+            self._noise_command.order_id = self._next_noise_order_id
+            self._noise_command.side = side
+            self._noise_command.price = (
+                native_env._max_price
+                if side == eigenbook.Side.BUY
+                else native_env._min_price
+            )
+            self._noise_command.quantity = quantity
+            self._noise_command.timestamp = self._next_noise_timestamp
+
+            native_env.engine.dispatch_with_buffer(
+                self._noise_command,
+                native_env.event_buffer,
+            )
+            self._next_noise_order_id += 1
+            self._next_noise_timestamp += 1
+            obs = native_env._get_obs()
+
+        return obs, reward, terminated, truncated, info
+
+
 def main() -> None:
     book = eigenbook.BookConfig()
     book.min_price = 90
@@ -90,6 +133,7 @@ def main() -> None:
         max_abs_inventory=100,
     )
     env = MarketMakerRewardWrapper(env)
+    env = NoiseTraderWrapper(env)
     env = OrderBookFeaturesWrapper(env)
 
     try:
