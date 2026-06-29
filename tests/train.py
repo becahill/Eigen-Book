@@ -1,6 +1,6 @@
 """Train and evaluate a PPO agent on the Eigen-Book Gymnasium environment."""
 
-import random
+import csv
 from pathlib import Path
 
 import gymnasium as gym
@@ -66,60 +66,74 @@ class OrderBookFeaturesWrapper(gym.ObservationWrapper):
         spread = best_ask_p - best_bid_p
         top_volume = best_bid_q + best_ask_q
 
-        return np.array(
-            [best_bid_p, best_ask_p, spread, top_volume],
-            dtype=np.float32,
-        )
+        return np.array([best_bid_p / 100000.0, best_ask_p / 100000.0, spread / 100.0, top_volume / 100.0], dtype=np.float32)
 
 
-class NoiseTraderWrapper(gym.Wrapper):
-    """Inject random aggressive IOC orders after agent actions."""
+class BinanceDataWrapper(gym.Wrapper):
+    """Inject five historical Binance trades after every agent action."""
 
-    def __init__(self, env, noise_prob=0.15):
+    def __init__(self, env: gym.Env, csv_path: str) -> None:
         super().__init__(env)
-        self.noise_prob = noise_prob
-        self._next_noise_order_id = 1_000_000_000
-        self._next_noise_timestamp = 1_000_000_000
-        self._noise_command = eigenbook.Command()
-        self._noise_command.instrument_id = self.env.unwrapped.instrument_id
-        self._noise_command.op = eigenbook.CommandOp.ADD
-        self._noise_command.time_in_force = eigenbook.TimeInForce.IOC
+        self._csv_file = open(csv_path, newline="", encoding="utf-8")
+        self._reader = csv.reader(self._csv_file)
 
-    def step(self, action):
+        native_env = self.env.unwrapped
+        self._market_command = eigenbook.Command()
+        self._market_command.instrument_id = native_env.instrument_id
+        self._market_command.op = eigenbook.CommandOp.MARKET
+        self._market_command.time_in_force = eigenbook.TimeInForce.IOC
+        self._next_replay_order_id = 1 << 63
+        self._next_replay_timestamp = 1 << 63
+
+    def reset(self, **kwargs):
+        self._csv_file.seek(0)
+        self._reader = csv.reader(self._csv_file)
+        self._next_replay_order_id = 1 << 63
+        self._next_replay_timestamp = 1 << 63
+        return super().reset(**kwargs)
+
+    def step(self, action: np.ndarray):
         obs, reward, terminated, truncated, info = self.env.step(action)
+        native_env = self.env.unwrapped
 
-        if random.random() < self.noise_prob and not (terminated or truncated):
-            native_env = self.env.unwrapped
-            side = random.choice((eigenbook.Side.BUY, eigenbook.Side.SELL))
-            quantity = random.randint(1, 5)
-
-            self._noise_command.order_id = self._next_noise_order_id
-            self._noise_command.side = side
-            self._noise_command.price = (
-                native_env._max_price
-                if side == eigenbook.Side.BUY
-                else native_env._min_price
+        for _ in range(5):
+            row = next(self._reader)
+            price = int(float(row[1]) * 100)
+            quantity = max(1, int(float(row[2]) * 100000))
+            is_buyer_maker = row[6]
+            side = (
+                eigenbook.Side.SELL
+                if is_buyer_maker == "True"
+                else eigenbook.Side.BUY
             )
-            self._noise_command.quantity = quantity
-            self._noise_command.timestamp = self._next_noise_timestamp
+
+            self._market_command.order_id = self._next_replay_order_id
+            self._market_command.side = side
+            self._market_command.price = price
+            self._market_command.quantity = quantity
+            self._market_command.timestamp = self._next_replay_timestamp
 
             native_env.engine.dispatch_with_buffer(
-                self._noise_command,
+                self._market_command,
                 native_env.event_buffer,
             )
-            self._next_noise_order_id += 1
-            self._next_noise_timestamp += 1
-            obs = native_env._get_obs()
+            self._next_replay_order_id += 1
+            self._next_replay_timestamp += 1
 
+        obs = native_env._get_obs()
         return obs, reward, terminated, truncated, info
+
+    def close(self) -> None:
+        self._csv_file.close()
+        super().close()
 
 
 def main() -> None:
     book = eigenbook.BookConfig()
-    book.min_price = 90
-    book.max_price = 110
-    book.max_orders = 64
-    book.order_id_map_capacity = 128
+    book.min_price = 4000000
+    book.max_price = 4500000
+    book.max_orders = 10000
+    book.order_id_map_capacity = 20000
     book.tick_size = 1
 
     instrument = eigenbook.InstrumentConfig()
@@ -132,8 +146,8 @@ def main() -> None:
         max_episode_steps=1000,
         max_abs_inventory=100,
     )
+    env = BinanceDataWrapper(env, 'BTCUSDT-aggTrades-2024-01-01.csv')
     env = MarketMakerRewardWrapper(env)
-    env = NoiseTraderWrapper(env)
     env = OrderBookFeaturesWrapper(env)
 
     try:
