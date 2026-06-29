@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import gymnasium as gym
+import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.env_checker import check_env
@@ -43,6 +44,33 @@ class MarketMakerRewardWrapper(gym.RewardWrapper):
         return -1.0 * reward
 
 
+class OrderBookFeaturesWrapper(gym.ObservationWrapper):
+    """Extract top-of-book price, spread, and volume features."""
+
+    def __init__(self, env):
+        super().__init__(env)
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(4,),
+            dtype=np.float32,
+        )
+
+    def observation(self, obs):
+        best_bid_p = obs[0, 0, 0]
+        best_bid_q = obs[0, 0, 1]
+        best_ask_p = obs[1, 0, 0]
+        best_ask_q = obs[1, 0, 1]
+
+        spread = best_ask_p - best_bid_p
+        top_volume = best_bid_q + best_ask_q
+
+        return np.array(
+            [best_bid_p, best_ask_p, spread, top_volume],
+            dtype=np.float32,
+        )
+
+
 def main() -> None:
     book = eigenbook.BookConfig()
     book.min_price = 90
@@ -62,6 +90,7 @@ def main() -> None:
         max_abs_inventory=100,
     )
     env = MarketMakerRewardWrapper(env)
+    env = OrderBookFeaturesWrapper(env)
 
     try:
         print("[validation] Running Stable Baselines3 check_env()...", flush=True)
