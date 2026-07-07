@@ -1,8 +1,53 @@
 # Eigen-Book
 [![CI](https://github.com/becahill/Eigen-Book/actions/workflows/ci.yml/badge.svg)](https://github.com/becahill/Eigen-Book/actions/workflows/ci.yml)
-Eigen-Book is a C++20 low-latency limit order book and matching engine. The
-core is fixed-capacity, header-only, dependency-free, and designed around
-deterministic behavior after construction.
+
+Eigen-Book is a C++20 low-latency limit order book and matching engine for
+deterministic price-time matching experiments. It supports single-book and
+multi-instrument routing, venue-style command validation, fixed-size binary
+commands, event emission, market-data sequencing, snapshots, and journal
+replay.
+
+The matching core is fixed-capacity, header-only, dependency-free, and designed
+for zero runtime heap allocation on hot paths after construction. Capacity
+exhaustion is reported with explicit `Status` values instead of exceptions, and
+preflight checks avoid partial execution when an operation cannot be recorded
+or stored completely.
+
+## Quick Review
+
+| Area | Current status |
+|---|---|
+| Engine contract | C++20, `namespace eigenbook`, strict warnings, no exceptions in hot-path engine code, deterministic behavior after initialization. |
+| Allocation contract | Orders, id lookup, levels, event logs, market-data buffers, snapshot workspace, and routing tables are configured up front. Hot-path add/cancel/modify/replace/dispatch paths use caller-owned or preallocated storage. |
+| Core data structures | `MemoryPool<Order>` for fixed-capacity orders, intrusive doubly linked FIFO queues per price level, dense price-indexed sides or bounded sparse storage, occupancy bitsets for best-price discovery, and fixed-capacity open-addressed order-id lookup. |
+| Matching semantics | FIFO price-time priority, GTC/IOC/FOK limit orders, market orders, O(1) cancel after id lookup, quantity reductions that keep priority, and reject-on-increase modify semantics. Deep semantics stay in [`docs/venue-semantics.md`](docs/venue-semantics.md). |
+| Recovery and data | Fixed-capacity events, incremental market data with sequence/gap detection, representation-independent checksums, deterministic snapshots, and CRC-protected journals. See [`docs/market-data-and-recovery.md`](docs/market-data-and-recovery.md). |
+| Python package | Optional pybind11 package for CPython 3.10-3.14 on macOS/Linux. Core runtime dependency is NumPy; Gymnasium and Stable-Baselines3 are extras for RL and PPO demos. Windows, PyPy, and portable wheels are not currently tested. |
+
+Build and test from a clean checkout:
+
+```sh
+cmake -S . -B build-debug -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-debug
+ctest --test-dir build-debug
+
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release
+ctest --test-dir build-release
+```
+
+Run the native benchmark binary from a Release build:
+
+```sh
+cmake --build build-release --target eigenbook_bench
+./build-release/eigenbook_bench
+```
+
+The data-structure and complexity rationale is documented in
+[`docs/architecture.md`](docs/architecture.md). Benchmark methodology and local
+recorded results live in [`docs/performance.md`](docs/performance.md); do not
+update benchmark numbers without rerunning locally and recording hardware and
+compiler context.
 
 ## Current Engine Scope
 
@@ -62,6 +107,32 @@ cmake --build build-release
 
 Clang, AppleClang, and GNU-like compilers build with `-Wall -Wextra -Werror`.
 Release builds also add `-O3 -march=native` for those compilers.
+
+## C++ Package Installation
+
+Eigen-Book installs as a header-only CMake package with the exported target
+`EigenBook::eigenbook`. The development install component includes the public
+headers from `include/` plus `EigenBookConfig.cmake`,
+`EigenBookConfigVersion.cmake`, and the exported target file.
+
+```sh
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release
+cmake --install build-release --component development --prefix /tmp/eigenbook
+```
+
+A downstream CMake project can consume that prefix with:
+
+```cmake
+find_package(EigenBook CONFIG REQUIRED)
+add_executable(consumer main.cpp)
+target_link_libraries(consumer PRIVATE EigenBook::eigenbook)
+```
+
+The installed package exposes headers directly from the include root, so
+existing includes such as `#include "MatchingEngine.hpp"` continue to work.
+CTest registers `eigenbook_install_consumer_smoke` to verify a temporary
+install prefix and an external consumer build.
 
 ## Tests
 
@@ -417,6 +488,26 @@ native command outcomes remain explicit `Status` values. Python never receives
 a partially initialized engine. Python `DispatchResult` values contain copied
 scalars, not native event spans.
 
+The core Python API intentionally covers the low-risk simulation boundary:
+
+- `BookConfig` and `InstrumentConfig`, including lot-size, STP policy, and
+  market-data capacity fields.
+- `Command` and `VenueCommand`; the latter carries `participant_id` and
+  `post_only` into `MatchingEngine.dispatch(...)`.
+- `Status`, `Side`, `TimeInForce`, `CommandOp`, `PriceLevelMode`, and
+  `SelfTradePolicy`.
+- `top_of_book`, caller-owned depth buffers, caller-owned command-event buffers,
+  `state_checksum()`, and per-instrument `market_data_sequence(...)`.
+- copied `DispatchResult` scalars, including STP counters and
+  `market_data_events_emitted`.
+
+Python does not currently bind snapshot/restore, journal record production,
+journal replay, command wire encode/decode helpers, `MarketDataEvent` payload
+buffers, gap detection, stats structs, or direct `OrderBook` methods. Use the
+C++ API for production recovery, persistence, and incremental market-data
+payload workflows until those bindings have dedicated buffer contracts and
+tests.
+
 `dispatch_with_buffer(command, events)` copies the emitted native records into
 the caller-owned NumPy array and returns the valid prefix length.
 `dispatch_result_with_buffer` performs the same copy and returns the scalar
@@ -566,6 +657,12 @@ latency, market impact, or out-of-sample profitability assessment. Evaluation
 reward demonstrates deterministic execution of this toy objective; it is not
 evidence of trading performance.
 
+An untested historical-market-data experiment lives in
+`experiments/train_market_data.py`. It is intentionally outside `tests/`
+because it requires a local Binance aggregate-trades CSV and writes
+TensorBoard/model artifacts. Use `scripts/train_ppo.py` for the maintained
+package demonstration.
+
 ### Python Tests And Wheel Validation
 
 Run core, RL, and PPO training tests from an installed package:
@@ -629,9 +726,10 @@ supported way to combine it with the Python sources into an installable wheel.
 GitHub Actions is configured in `.github/workflows/ci.yml`. It runs Debug,
 Release, and combined ASAN/UBSAN builds, runs deterministic tests under the
 sanitizers, explicitly runs the zero-allocation hot-path guard in Debug and
-Release, and compiles the benchmark target without running benchmark timing in
-CI. Installed core-package tests cover CPython 3.10 through 3.14 without
-Gymnasium; separate jobs install the RL extra, run a Python 3.12 PPO
+Release, runs the installed-package CMake consumer smoke, and compiles the
+benchmark target without running benchmark timing in CI. Installed core-package
+tests cover CPython 3.10 through 3.14 without Gymnasium; separate jobs install
+the RL extra, run a Python 3.12 PPO
 train-save-load-evaluate smoke cycle entirely under the runner temporary
 directory, and build/install a wheel in a clean environment. No job publishes
 packages. Separate Clang 18 jobs run focused static analysis and fixed-run

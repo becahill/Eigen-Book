@@ -27,8 +27,32 @@ wheelhouse/
 .coverage
 htmlcov/
 
-# PPO training artifacts
+# Local market-data downloads
+data/
+market-data/
+market_data/
+*-aggTrades-*.csv
+*-aggTrades-*.zip
+*-trades-*.csv
+*-trades-*.zip
+*.parquet
+
+# TensorBoard and experiment logs
+tb_logs/
+runs/
+**/events.out.tfevents.*
+
+# PPO/model and generated experiment artifacts
 training-output/
+experiment-output/
+experiments/output/
+models/
+checkpoints/
 ppo_*.zip
+*.pt
+*.pth
+*.onnx
+wandb/
+mlruns/
 
 .DS_Store

@@ -1,4 +1,10 @@
-"""Train and evaluate a PPO agent on the Eigen-Book Gymnasium environment."""
+"""Local historical-market-data PPO experiment.
+
+This script is intentionally outside tests because it depends on a local
+Binance aggregate-trade CSV and writes TensorBoard/model artifacts. The
+maintained, deterministic PPO demonstration and its tests live in
+``scripts/train_ppo.py`` and ``tests/test_train_ppo.py``.
+"""
 
 import csv
 from pathlib import Path
@@ -16,6 +22,8 @@ from eigenbook.env import LimitOrderBookEnv
 TRAINING_TIMESTEPS = 100_000
 EVALUATION_STEPS = 1_000
 MODEL_PATH = "ppo_eigenbook_agent"
+MARKET_DATA_PATH = Path("BTCUSDT-aggTrades-2024-01-01.csv")
+TENSORBOARD_LOG_DIR = "tb_logs"
 
 
 class TrainingProgressCallback(BaseCallback):
@@ -38,11 +46,20 @@ class TrainingProgressCallback(BaseCallback):
         return True
 
 
-class MarketMakerRewardWrapper(gym.RewardWrapper):
-    """Invert the native reward to favor passive market-making behavior."""
+class MarketMakerRewardWrapper(gym.Wrapper):
+    """Shape PnL with inventory exposure and terminal liquidation penalties."""
 
-    def reward(self, reward):
-        return -1.0 * reward
+    def step(self, action):
+        obs, base_pnl, terminated, truncated, info = self.env.step(action)
+
+        inventory = info.get("inventory", 0)
+        step_penalty = 0.01 * (inventory ** 2)
+        shaped_reward = base_pnl - step_penalty
+
+        if (terminated or truncated) and abs(inventory) >= 100:
+            shaped_reward -= 5000.0
+
+        return obs, shaped_reward, terminated, truncated, info
 
 
 class OrderBookFeaturesWrapper(gym.ObservationWrapper):
@@ -146,7 +163,7 @@ def main() -> None:
         max_episode_steps=1000,
         max_abs_inventory=100,
     )
-    env = BinanceDataWrapper(env, 'BTCUSDT-aggTrades-2024-01-01.csv')
+    env = BinanceDataWrapper(env, str(MARKET_DATA_PATH))
     env = MarketMakerRewardWrapper(env)
     env = OrderBookFeaturesWrapper(env)
 
@@ -163,6 +180,7 @@ def main() -> None:
             batch_size=64,
             n_steps=2_000,
             verbose=1,
+            tensorboard_log=TENSORBOARD_LOG_DIR,
         )
 
         print(

@@ -9,6 +9,9 @@ def make_book_config(
     max_price: int = 110,
     max_orders: int = 16,
     event_log_capacity: int = 0,
+    lot_size: int = 0,
+    self_trade_policy: eb.SelfTradePolicy = eb.SelfTradePolicy.DISABLED,
+    market_data_capacity: int = 0,
 ) -> eb.BookConfig:
     config = eb.BookConfig()
     config.min_price = min_price
@@ -18,6 +21,9 @@ def make_book_config(
     config.tick_size = 1
     config.event_log_capacity = event_log_capacity
     config.price_level_mode = eb.PriceLevelMode.DENSE
+    config.lot_size = lot_size
+    config.self_trade_policy = self_trade_policy
+    config.market_data_capacity = market_data_capacity
     return config
 
 
@@ -26,6 +32,8 @@ def make_instrument(
     instrument_id: int = 101,
     book_config: eb.BookConfig | None = None,
     lot_size: int = 1,
+    self_trade_policy: eb.SelfTradePolicy = eb.SelfTradePolicy.DISABLED,
+    market_data_capacity: int = 0,
 ) -> eb.InstrumentConfig:
     config = eb.InstrumentConfig()
     config.instrument_id = instrument_id
@@ -34,6 +42,8 @@ def make_instrument(
     )
     config.tick_size = 1
     config.lot_size = lot_size
+    config.self_trade_policy = self_trade_policy
+    config.market_data_capacity = market_data_capacity
     return config
 
 

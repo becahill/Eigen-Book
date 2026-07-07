@@ -46,10 +46,19 @@ constexpr std::array<const char*, 4> kSnapshotRestoreNames{
     "Restore snapshot (4096 orders)",
 };
 constexpr std::uint32_t kWidePriceCount = 20;
+constexpr std::size_t kCoreBenchmarkCount = 15;
+constexpr std::size_t kBenchmarkResultCount =
+    kCoreBenchmarkCount + kSnapshotRestoreSizes.size();
+
+enum class OutputFormat : std::uint8_t {
+    Text,
+    Json,
+};
 
 struct BenchmarkOptions final {
     std::uint32_t operations{kDefaultOperations};
     std::uint32_t iterations{kDefaultIterations};
+    OutputFormat format{OutputFormat::Text};
 };
 
 struct BenchmarkResult final {
@@ -61,6 +70,14 @@ struct BenchmarkResult final {
     std::uint64_t p50_ns{0};
     std::uint64_t p95_ns{0};
     std::uint64_t p99_ns{0};
+};
+
+struct RunContext final {
+    char timestamp[32]{};
+    char cpu_model[256]{};
+    char os[256]{};
+    char compiler[256]{};
+    char compiler_build[256]{};
 };
 
 [[nodiscard]] bool parse_positive_u32(const char* const text, std::uint32_t& value) noexcept
@@ -79,6 +96,22 @@ struct BenchmarkResult final {
 
     value = static_cast<std::uint32_t>(parsed);
     return true;
+}
+
+[[nodiscard]] bool parse_format(const char* const text, OutputFormat& format) noexcept
+{
+    if (text == nullptr) {
+        return false;
+    }
+    if (std::strcmp(text, "text") == 0) {
+        format = OutputFormat::Text;
+        return true;
+    }
+    if (std::strcmp(text, "json") == 0) {
+        format = OutputFormat::Json;
+        return true;
+    }
+    return false;
 }
 
 [[nodiscard]] bool parse_options(const int argc,
@@ -102,6 +135,14 @@ struct BenchmarkResult final {
             continue;
         }
 
+        if (std::strcmp(argv[index], "--format") == 0) {
+            if (index + 1 >= argc || !parse_format(argv[index + 1], options.format)) {
+                return false;
+            }
+            ++index;
+            continue;
+        }
+
         return false;
     }
 
@@ -112,9 +153,10 @@ struct BenchmarkResult final {
 void print_usage(const char* const program)
 {
     std::fprintf(stderr,
-                 "Usage: %s [--operations N] [--iterations N]\n"
+                 "Usage: %s [--operations N] [--iterations N] [--format text|json]\n"
                  "  operations must be a multiple of 20 in [20, %u]\n"
-                 "  iterations must be in [1, 100]\n",
+                 "  iterations must be in [1, 100]\n"
+                 "  format defaults to text\n",
                  program,
                  kMaximumOperations);
 }
@@ -175,35 +217,59 @@ void read_cpu_model(char* const output, const std::size_t capacity) noexcept
 #endif
 }
 
-void print_run_context(const BenchmarkOptions& options)
+void read_os_description(char* const output, const std::size_t capacity) noexcept
 {
-    char timestamp[32]{};
-    char cpu_model[256]{};
-    read_utc_timestamp(timestamp, sizeof(timestamp));
-    read_cpu_model(cpu_model, sizeof(cpu_model));
-
-    std::printf("Eigen-Book benchmark run context\n");
-    std::printf("Timestamp (UTC): %s\n", timestamp);
-    std::printf("CPU: %s\n", cpu_model);
+    std::snprintf(output, capacity, "unavailable");
 #if defined(__unix__) || defined(__APPLE__)
     utsname system{};
     if (uname(&system) == 0) {
-        std::printf("OS: %s %s (%s)\n", system.sysname, system.release, system.machine);
-    } else {
-        std::printf("OS: unavailable\n");
+        std::snprintf(output, capacity, "%s %s (%s)", system.sysname, system.release, system.machine);
     }
-#else
-    std::printf("OS: unavailable\n");
 #endif
+}
+
+void read_compiler_build(char* const output, const std::size_t capacity) noexcept
+{
+    std::snprintf(output, capacity, "unavailable");
+#if defined(__clang__)
+    std::snprintf(output, capacity, "%s", __clang_version__);
+#elif defined(__GNUC__)
+    std::snprintf(output, capacity, "%s", __VERSION__);
+#elif defined(_MSC_VER)
+    std::snprintf(output, capacity, "MSVC %d", _MSC_VER);
+#endif
+}
+
+[[nodiscard]] RunContext read_run_context() noexcept
+{
+    RunContext context{};
+    read_utc_timestamp(context.timestamp, sizeof(context.timestamp));
+    read_cpu_model(context.cpu_model, sizeof(context.cpu_model));
+    read_os_description(context.os, sizeof(context.os));
+    std::snprintf(context.compiler,
+                  sizeof(context.compiler),
+                  "%s %s",
+                  benchmark_build::kCompilerId,
+                  benchmark_build::kCompilerVersion);
+    read_compiler_build(context.compiler_build, sizeof(context.compiler_build));
+    return context;
+}
+
+void print_run_context(const RunContext& context, const BenchmarkOptions& options)
+{
+    std::printf("Eigen-Book benchmark run context\n");
+    std::printf("Timestamp (UTC): %s\n", context.timestamp);
+    std::printf("CPU: %s\n", context.cpu_model);
+    std::printf("OS: %s\n", context.os);
     std::printf("Compiler: %s %s\n",
                 benchmark_build::kCompilerId,
                 benchmark_build::kCompilerVersion);
 #if defined(__clang__)
-    std::printf("Compiler build: %s\n", __clang_version__);
+    std::printf("Compiler build: %s\n", context.compiler_build);
 #elif defined(__GNUC__)
-    std::printf("Compiler build: %s\n", __VERSION__);
+    std::printf("Compiler build: %s\n", context.compiler_build);
 #elif defined(_MSC_VER)
-    std::printf("Compiler build: MSVC %d\n", _MSC_VER);
+    std::printf("Compiler build: %s\n", context.compiler_build);
 #endif
     std::printf("Compiler path: %s\n", benchmark_build::kCompilerPath);
     std::printf("Build type: %s\n", benchmark_build::kBuildType);
@@ -846,6 +912,41 @@ struct Event final {
     });
 }
 
+[[nodiscard]] std::array<BenchmarkResult, kBenchmarkResultCount>
+run_benchmark_iteration(const std::uint32_t operations)
+{
+    std::array<BenchmarkResult, kBenchmarkResultCount> results{};
+    std::size_t result_index = 0;
+
+    results[result_index++] = benchmark_add_orders(operations);
+    results[result_index++] = benchmark_add_with_venue_checks(operations);
+    results[result_index++] = benchmark_add_with_market_data(operations);
+    results[result_index++] = benchmark_dense_wide_sparse_prices(operations);
+    results[result_index++] = benchmark_sparse_wide_sparse_prices(operations);
+    results[result_index++] = benchmark_cancel_orders(operations);
+    results[result_index++] = benchmark_modify_orders(operations);
+    results[result_index++] = benchmark_replace_orders(operations);
+    results[result_index++] = benchmark_market_matches(operations);
+    results[result_index++] = benchmark_ioc_partial_matches(operations);
+    results[result_index++] = benchmark_fok_rejects(operations);
+    results[result_index++] = benchmark_fok_accepts(operations);
+    results[result_index++] = benchmark_mixed_workload(operations);
+    results[result_index++] = benchmark_replay_dispatch(operations);
+    results[result_index++] = benchmark_snapshot_serialize(operations);
+    for (std::size_t index = 0; index < kSnapshotRestoreSizes.size(); ++index) {
+        const std::uint32_t order_count = kSnapshotRestoreSizes[index];
+        results[result_index++] =
+            benchmark_snapshot_restore(kSnapshotRestoreNames[index],
+                                       snapshot_restore_operations(operations, order_count),
+                                       order_count);
+    }
+
+    if (result_index != results.size()) {
+        std::abort();
+    }
+    return results;
+}
+
 void print_result(const BenchmarkResult& result)
 {
     std::printf("| %-29s | %10llu | %10.3f | %14.0f | %8.1f | %6llu | %6llu | %6llu |\n",
@@ -859,6 +960,174 @@ void print_result(const BenchmarkResult& result)
                 static_cast<unsigned long long>(result.p99_ns));
 }
 
+void print_text_iteration(const std::uint32_t iteration,
+                          const BenchmarkOptions& options,
+                          const std::array<BenchmarkResult, kBenchmarkResultCount>& results)
+{
+    std::printf("Eigen-Book microbenchmarks (iteration %u/%u, %u operations per workload)\n",
+                iteration + 1U,
+                options.iterations,
+                options.operations);
+    std::printf("| Scenario                      | Operations | Total ms   | Ops/sec        | Avg ns   | p50 ns | p95 ns | p99 ns |\n");
+    std::printf("|-------------------------------|------------|------------|----------------|----------|--------|--------|--------|\n");
+    for (const BenchmarkResult& result : results) {
+        print_result(result);
+    }
+    std::printf("\n");
+}
+
+void print_json_indent(const std::uint32_t spaces) noexcept
+{
+    for (std::uint32_t index = 0; index < spaces; ++index) {
+        std::putchar(' ');
+    }
+}
+
+void print_json_string(const char* const value) noexcept
+{
+    std::putchar('"');
+    const unsigned char* cursor =
+        reinterpret_cast<const unsigned char*>(value == nullptr ? "" : value);
+    while (*cursor != '\0') {
+        const unsigned char ch = *cursor;
+        switch (ch) {
+        case '"':
+            std::printf("\\\"");
+            break;
+        case '\\':
+            std::printf("\\\\");
+            break;
+        case '\b':
+            std::printf("\\b");
+            break;
+        case '\f':
+            std::printf("\\f");
+            break;
+        case '\n':
+            std::printf("\\n");
+            break;
+        case '\r':
+            std::printf("\\r");
+            break;
+        case '\t':
+            std::printf("\\t");
+            break;
+        default:
+            if (ch < 0x20U) {
+                std::printf("\\u%04x", static_cast<unsigned int>(ch));
+            } else {
+                std::putchar(static_cast<int>(ch));
+            }
+            break;
+        }
+        ++cursor;
+    }
+    std::putchar('"');
+}
+
+void print_json_key_string(const std::uint32_t indent,
+                           const char* const key,
+                           const char* const value,
+                           const bool comma) noexcept
+{
+    print_json_indent(indent);
+    print_json_string(key);
+    std::printf(": ");
+    print_json_string(value);
+    std::printf("%s\n", comma ? "," : "");
+}
+
+void print_json_key_u32(const std::uint32_t indent,
+                        const char* const key,
+                        const std::uint32_t value,
+                        const bool comma) noexcept
+{
+    print_json_indent(indent);
+    print_json_string(key);
+    std::printf(": %u%s\n", value, comma ? "," : "");
+}
+
+void print_json_key_u64(const std::uint32_t indent,
+                        const char* const key,
+                        const std::uint64_t value,
+                        const bool comma) noexcept
+{
+    print_json_indent(indent);
+    print_json_string(key);
+    std::printf(": %llu%s\n", static_cast<unsigned long long>(value), comma ? "," : "");
+}
+
+void print_json_key_double(const std::uint32_t indent,
+                           const char* const key,
+                           const double value,
+                           const bool comma) noexcept
+{
+    print_json_indent(indent);
+    print_json_string(key);
+    std::printf(": %.9f%s\n", value, comma ? "," : "");
+}
+
+void print_json_begin(const RunContext& context, const BenchmarkOptions& options) noexcept
+{
+    std::printf("{\n");
+    print_json_key_string(2, "schema", "eigenbook.benchmark.v1", true);
+    std::printf("  \"context\": {\n");
+    print_json_key_string(4, "timestamp", context.timestamp, true);
+    print_json_key_string(4, "cpu", context.cpu_model, true);
+    print_json_key_string(4, "os", context.os, true);
+    print_json_key_string(4, "compiler", context.compiler, true);
+    print_json_key_string(4, "compiler_build", context.compiler_build, true);
+    print_json_key_string(4, "compiler_path", benchmark_build::kCompilerPath, true);
+    print_json_key_string(4, "build_type", benchmark_build::kBuildType, true);
+    print_json_key_string(4, "optimization_flags", benchmark_build::kOptimizationFlags, true);
+    print_json_key_string(4, "cmake_version", benchmark_build::kCMakeVersion, true);
+    print_json_key_string(4, "cmake_generator", benchmark_build::kCMakeGenerator, true);
+    print_json_key_u32(4, "operations", options.operations, true);
+    print_json_key_u32(4, "iterations", options.iterations, true);
+    print_json_key_u32(4, "sampling_block_size", kSampleBlockSize, false);
+    std::printf("  },\n");
+    std::printf("  \"units\": {\n");
+    print_json_key_string(4, "total_time_ms", "milliseconds", true);
+    print_json_key_string(4, "operations_per_second", "operations/second", true);
+    print_json_key_string(4, "latency", "nanoseconds/operation", false);
+    std::printf("  },\n");
+    std::printf("  \"results\": [\n");
+}
+
+void print_json_result(const BenchmarkResult& result, const bool comma) noexcept
+{
+    std::printf("      {\n");
+    print_json_key_string(8, "scenario", result.name, true);
+    print_json_key_u64(8, "operations", result.operations, true);
+    print_json_key_double(8, "total_time_ms", result.total_time_ms, true);
+    print_json_key_double(8, "operations_per_second", result.operations_per_second, true);
+    print_json_key_double(8, "average_ns", result.average_ns, true);
+    print_json_key_u64(8, "p50_ns", result.p50_ns, true);
+    print_json_key_u64(8, "p95_ns", result.p95_ns, true);
+    print_json_key_u64(8, "p99_ns", result.p99_ns, false);
+    std::printf("      }%s\n", comma ? "," : "");
+}
+
+void print_json_iteration(const std::uint32_t iteration,
+                          const std::array<BenchmarkResult, kBenchmarkResultCount>& results,
+                          const bool comma) noexcept
+{
+    std::printf("    {\n");
+    print_json_key_u32(6, "iteration", iteration + 1U, true);
+    std::printf("      \"benchmarks\": [\n");
+    for (std::size_t index = 0; index < results.size(); ++index) {
+        print_json_result(results[index], index + 1U < results.size());
+    }
+    std::printf("      ]\n");
+    std::printf("    }%s\n", comma ? "," : "");
+}
+
+void print_json_end() noexcept
+{
+    std::printf("  ]\n");
+    std::printf("}\n");
+}
+
 } // namespace
 
 int main(const int argc, char* const argv[])
@@ -869,57 +1138,23 @@ int main(const int argc, char* const argv[])
         return 2;
     }
 
-    print_run_context(options);
-    for (std::uint32_t iteration = 0; iteration < options.iterations; ++iteration) {
-        const BenchmarkResult add = benchmark_add_orders(options.operations);
-        const BenchmarkResult venue_checks = benchmark_add_with_venue_checks(options.operations);
-        const BenchmarkResult market_data = benchmark_add_with_market_data(options.operations);
-        const BenchmarkResult dense_wide = benchmark_dense_wide_sparse_prices(options.operations);
-        const BenchmarkResult sparse_wide = benchmark_sparse_wide_sparse_prices(options.operations);
-        const BenchmarkResult cancel = benchmark_cancel_orders(options.operations);
-        const BenchmarkResult modify = benchmark_modify_orders(options.operations);
-        const BenchmarkResult replace = benchmark_replace_orders(options.operations);
-        const BenchmarkResult match = benchmark_market_matches(options.operations);
-        const BenchmarkResult ioc = benchmark_ioc_partial_matches(options.operations);
-        const BenchmarkResult fok_reject = benchmark_fok_rejects(options.operations);
-        const BenchmarkResult fok_accept = benchmark_fok_accepts(options.operations);
-        const BenchmarkResult mixed = benchmark_mixed_workload(options.operations);
-        const BenchmarkResult replay_dispatch = benchmark_replay_dispatch(options.operations);
-        const BenchmarkResult snapshot_serialize = benchmark_snapshot_serialize(options.operations);
-        std::array<BenchmarkResult, kSnapshotRestoreSizes.size()> snapshot_restores{};
-        for (std::size_t index = 0; index < kSnapshotRestoreSizes.size(); ++index) {
-            const std::uint32_t order_count = kSnapshotRestoreSizes[index];
-            snapshot_restores[index] =
-                benchmark_snapshot_restore(kSnapshotRestoreNames[index],
-                                           snapshot_restore_operations(options.operations, order_count),
-                                           order_count);
+    const RunContext context = read_run_context();
+    if (options.format == OutputFormat::Json) {
+        print_json_begin(context, options);
+        for (std::uint32_t iteration = 0; iteration < options.iterations; ++iteration) {
+            const std::array<BenchmarkResult, kBenchmarkResultCount> results =
+                run_benchmark_iteration(options.operations);
+            print_json_iteration(iteration, results, iteration + 1U < options.iterations);
         }
+        print_json_end();
+        return 0;
+    }
 
-        std::printf("Eigen-Book microbenchmarks (iteration %u/%u, %u operations per workload)\n",
-                    iteration + 1U,
-                    options.iterations,
-                    options.operations);
-        std::printf("| Scenario                      | Operations | Total ms   | Ops/sec        | Avg ns   | p50 ns | p95 ns | p99 ns |\n");
-        std::printf("|-------------------------------|------------|------------|----------------|----------|--------|--------|--------|\n");
-        print_result(add);
-        print_result(venue_checks);
-        print_result(market_data);
-        print_result(dense_wide);
-        print_result(sparse_wide);
-        print_result(cancel);
-        print_result(modify);
-        print_result(replace);
-        print_result(match);
-        print_result(ioc);
-        print_result(fok_reject);
-        print_result(fok_accept);
-        print_result(mixed);
-        print_result(replay_dispatch);
-        print_result(snapshot_serialize);
-        for (const BenchmarkResult& snapshot_restore : snapshot_restores) {
-            print_result(snapshot_restore);
-        }
-        std::printf("\n");
+    print_run_context(context, options);
+    for (std::uint32_t iteration = 0; iteration < options.iterations; ++iteration) {
+        const std::array<BenchmarkResult, kBenchmarkResultCount> results =
+            run_benchmark_iteration(options.operations);
+        print_text_iteration(iteration, options, results);
     }
     return 0;
 }

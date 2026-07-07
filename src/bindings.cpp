@@ -45,6 +45,9 @@ struct PythonDispatchResult final {
     bool has_last_price{false};
     Price last_price{0};
     std::uint32_t events_emitted{0};
+    bool aggressor_cancelled_by_stp{false};
+    std::uint32_t resting_orders_cancelled_by_stp{0};
+    std::uint32_t market_data_events_emitted{0};
 };
 
 [[nodiscard]] PythonDispatchResult copy_dispatch_result(
@@ -66,7 +69,20 @@ struct PythonDispatchResult final {
         source.has_last_price,
         source.last_price,
         source.events_emitted,
+        source.aggressor_cancelled_by_stp,
+        source.resting_orders_cancelled_by_stp,
+        source.market_data_events_emitted,
     };
+}
+
+[[nodiscard]] InstrumentId command_instrument_id(const Command& command) noexcept
+{
+    return command.instrument_id;
+}
+
+[[nodiscard]] InstrumentId command_instrument_id(const VenueCommand& command) noexcept
+{
+    return command.command.instrument_id;
 }
 
 [[nodiscard]] std::unique_ptr<MatchingEngine> make_matching_engine(const py::sequence& configs)
@@ -146,12 +162,13 @@ void validate_event_buffer(
     }
 }
 
+template <typename CommandLike>
 [[nodiscard]] DispatchResult dispatch_and_copy_events(
     MatchingEngine& engine,
-    const Command& command,
+    const CommandLike& command,
     py::array_t<BookEvent, py::array::c_style> event_buffer)
 {
-    validate_event_buffer(engine, command.instrument_id, event_buffer);
+    validate_event_buffer(engine, command_instrument_id(command), event_buffer);
 
     const DispatchResult result = engine.dispatch(command);
     if (!result.events.empty()) {
@@ -160,7 +177,7 @@ void validate_event_buffer(
     return result;
 }
 
-[[nodiscard]] std::uint32_t dispatch_with_buffer(
+[[nodiscard]] std::uint32_t dispatch_command_with_buffer(
     MatchingEngine& engine,
     const Command& command,
     py::array_t<BookEvent, py::array::c_style> event_buffer)
@@ -168,9 +185,26 @@ void validate_event_buffer(
     return dispatch_and_copy_events(engine, command, std::move(event_buffer)).events_emitted;
 }
 
-[[nodiscard]] PythonDispatchResult dispatch_result_with_buffer(
+[[nodiscard]] std::uint32_t dispatch_venue_command_with_buffer(
+    MatchingEngine& engine,
+    const VenueCommand& command,
+    py::array_t<BookEvent, py::array::c_style> event_buffer)
+{
+    return dispatch_and_copy_events(engine, command, std::move(event_buffer)).events_emitted;
+}
+
+[[nodiscard]] PythonDispatchResult dispatch_command_result_with_buffer(
     MatchingEngine& engine,
     const Command& command,
+    py::array_t<BookEvent, py::array::c_style> event_buffer)
+{
+    return copy_dispatch_result(
+        dispatch_and_copy_events(engine, command, std::move(event_buffer)));
+}
+
+[[nodiscard]] PythonDispatchResult dispatch_venue_command_result_with_buffer(
+    MatchingEngine& engine,
+    const VenueCommand& command,
     py::array_t<BookEvent, py::array::c_style> event_buffer)
 {
     return copy_dispatch_result(
@@ -180,6 +214,13 @@ void validate_event_buffer(
 [[nodiscard]] PythonDispatchResult dispatch_command(
     MatchingEngine& engine,
     const Command& command)
+{
+    return copy_dispatch_result(engine.dispatch(command));
+}
+
+[[nodiscard]] PythonDispatchResult dispatch_venue_command(
+    MatchingEngine& engine,
+    const VenueCommand& command)
 {
     return copy_dispatch_result(engine.dispatch(command));
 }
@@ -274,6 +315,12 @@ void bind_enums(py::module_& module)
         .value("IOC", TimeInForce::Ioc)
         .value("FOK", TimeInForce::Fok);
 
+    py::enum_<SelfTradePolicy>(module, "SelfTradePolicy")
+        .value("DISABLED", SelfTradePolicy::Disabled)
+        .value("CANCEL_AGGRESSOR", SelfTradePolicy::CancelAggressor)
+        .value("CANCEL_RESTING", SelfTradePolicy::CancelResting)
+        .value("CANCEL_BOTH", SelfTradePolicy::CancelBoth);
+
     py::enum_<PriceLevelMode>(module, "PriceLevelMode")
         .value("DENSE", PriceLevelMode::Dense)
         .value("SPARSE", PriceLevelMode::Sparse);
@@ -342,14 +389,19 @@ void bind_configuration(py::module_& module)
         .def_readwrite("order_id_map_capacity", &BookConfig::order_id_map_capacity)
         .def_readwrite("tick_size", &BookConfig::tick_size)
         .def_readwrite("event_log_capacity", &BookConfig::event_log_capacity)
-        .def_readwrite("price_level_mode", &BookConfig::price_level_mode);
+        .def_readwrite("price_level_mode", &BookConfig::price_level_mode)
+        .def_readwrite("lot_size", &BookConfig::lot_size)
+        .def_readwrite("self_trade_policy", &BookConfig::self_trade_policy)
+        .def_readwrite("market_data_capacity", &BookConfig::market_data_capacity);
 
     py::class_<InstrumentConfig>(module, "InstrumentConfig")
         .def(py::init<>())
         .def_readwrite("instrument_id", &InstrumentConfig::instrument_id)
         .def_readwrite("book_config", &InstrumentConfig::book_config)
         .def_readwrite("tick_size", &InstrumentConfig::tick_size)
-        .def_readwrite("lot_size", &InstrumentConfig::lot_size);
+        .def_readwrite("lot_size", &InstrumentConfig::lot_size)
+        .def_readwrite("self_trade_policy", &InstrumentConfig::self_trade_policy)
+        .def_readwrite("market_data_capacity", &InstrumentConfig::market_data_capacity);
 }
 
 void bind_command_and_results(py::module_& module)
@@ -364,6 +416,20 @@ void bind_command_and_results(py::module_& module)
         .def_readwrite("quantity", &Command::quantity)
         .def_readwrite("time_in_force", &Command::time_in_force)
         .def_readwrite("timestamp", &Command::timestamp);
+
+    py::class_<VenueCommand>(module, "VenueCommand")
+        .def(py::init<>())
+        .def(py::init([](const Command& command,
+                         const ParticipantId participant_id,
+                         const bool post_only) noexcept {
+                 return VenueCommand{command, participant_id, post_only};
+             }),
+             py::arg("command"),
+             py::arg("participant_id") = kAnonymousParticipantId,
+             py::arg("post_only") = false)
+        .def_readwrite("command", &VenueCommand::command)
+        .def_readwrite("participant_id", &VenueCommand::participant_id)
+        .def_readwrite("post_only", &VenueCommand::post_only);
 
     py::class_<PythonDispatchResult>(module, "DispatchResult")
         .def_readonly("status", &PythonDispatchResult::status)
@@ -380,7 +446,13 @@ void bind_command_and_results(py::module_& module)
         .def_readonly("fills", &PythonDispatchResult::fills)
         .def_readonly("has_last_price", &PythonDispatchResult::has_last_price)
         .def_readonly("last_price", &PythonDispatchResult::last_price)
-        .def_readonly("events_emitted", &PythonDispatchResult::events_emitted);
+        .def_readonly("events_emitted", &PythonDispatchResult::events_emitted)
+        .def_readonly("aggressor_cancelled_by_stp",
+                      &PythonDispatchResult::aggressor_cancelled_by_stp)
+        .def_readonly("resting_orders_cancelled_by_stp",
+                      &PythonDispatchResult::resting_orders_cancelled_by_stp)
+        .def_readonly("market_data_events_emitted",
+                      &PythonDispatchResult::market_data_events_emitted);
 
     py::class_<BestQuote>(module, "BestQuote")
         .def_readonly("valid", &BestQuote::valid)
@@ -442,12 +514,23 @@ PYBIND11_MODULE(_eigenbook, module)
         .def("dispatch",
              &eigenbook::dispatch_command,
              py::arg("command"))
+        .def("dispatch",
+             &eigenbook::dispatch_venue_command,
+             py::arg("command"))
         .def("dispatch_with_buffer",
-             &eigenbook::dispatch_with_buffer,
+             &eigenbook::dispatch_command_with_buffer,
+             py::arg("command"),
+             py::arg("event_buffer").noconvert())
+        .def("dispatch_with_buffer",
+             &eigenbook::dispatch_venue_command_with_buffer,
              py::arg("command"),
              py::arg("event_buffer").noconvert())
         .def("dispatch_result_with_buffer",
-             &eigenbook::dispatch_result_with_buffer,
+             &eigenbook::dispatch_command_result_with_buffer,
+             py::arg("command"),
+             py::arg("event_buffer").noconvert())
+        .def("dispatch_result_with_buffer",
+             &eigenbook::dispatch_venue_command_result_with_buffer,
              py::arg("command"),
              py::arg("event_buffer").noconvert())
         .def("event_buffer_capacity",
@@ -463,6 +546,10 @@ PYBIND11_MODULE(_eigenbook, module)
              py::arg("event_buffer").noconvert(),
              py::arg("event_count"),
              py::arg("requested_quantity"))
+        .def("market_data_sequence",
+             &eigenbook::MatchingEngine::market_data_sequence,
+             py::arg("instrument_id"))
+        .def("state_checksum", &eigenbook::MatchingEngine::state_checksum)
         .def("top_of_book", &eigenbook::MatchingEngine::top_of_book, py::arg("instrument_id"));
 
     module.def(

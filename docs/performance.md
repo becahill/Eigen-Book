@@ -11,17 +11,30 @@ state or objects cannot affect the result:
 
 ```sh
 cmake -E remove_directory build-benchmark-release
-./scripts/run_benchmarks.sh build-benchmark-release 50000 1 \
+./scripts/run_benchmarks.sh build-benchmark-release 50000 1 text \
   | tee benchmark-results.txt
 ```
 
 The positional arguments are build directory, operations per workload, and
-complete workload iterations. Operations must be a multiple of 20 from 20
-through 1,000,000; iterations must be from 1 through 100.
+complete workload iterations, followed by an optional output format. Operations
+must be a multiple of 20 from 20 through 1,000,000; iterations must be from 1
+through 100. Format defaults to `text` and may be `text` or `json`.
+
+Use JSON when preserving results for comparison tooling:
+
+```sh
+cmake -E remove_directory build-benchmark-json
+./scripts/run_benchmarks.sh build-benchmark-json 50000 1 json \
+  > benchmark-results.json
+python3 -m json.tool benchmark-results.json >/dev/null
+```
+
+In JSON mode the script sends CMake configure/build output to stderr and emits
+only the benchmark JSON document on stdout.
 
 The script configures a clean Release build with tests, examples, fuzzers, and
-Python bindings disabled. It then builds and runs CMake's `run_benchmarks`
-target. The equivalent commands are:
+Python bindings disabled. In text mode it builds and runs CMake's
+`run_benchmarks` target. The equivalent commands are:
 
 ```sh
 cmake -S . -B build-benchmark-release \
@@ -32,13 +45,25 @@ cmake -S . -B build-benchmark-release \
   -DEIGENBOOK_BUILD_PYTHON=OFF \
   -DEIGENBOOK_BUILD_BENCHMARKS=ON \
   -DEIGENBOOK_BENCHMARK_OPERATIONS=50000 \
-  -DEIGENBOOK_BENCHMARK_ITERATIONS=1
+  -DEIGENBOOK_BENCHMARK_ITERATIONS=1 \
+  -DEIGENBOOK_BENCHMARK_FORMAT=text
 cmake --build build-benchmark-release --parallel --target run_benchmarks
 ```
 
-Every executable run prints its UTC start time, CPU model, OS/kernel, compiler
-and path, build type, optimization flags, CMake version/generator, iteration
-count, workload sizes, sampling block size, and units before any result rows.
+For machine-readable output from an existing build, run the executable directly:
+
+```sh
+cmake --build build-benchmark-release --parallel --target eigenbook_bench
+./build-benchmark-release/eigenbook_bench \
+  --operations 50000 --iterations 1 --format json \
+  > benchmark-results.json
+```
+
+The default text output prints its UTC start time, CPU model, OS/kernel,
+compiler and path, build type, optimization flags, CMake version/generator,
+iteration count, workload sizes, sampling block size, and units before any
+result rows. JSON output records the benchmark run context under `context`,
+with per-iteration rows under `results`.
 
 ## Python Boundary Benchmark
 
@@ -84,7 +109,8 @@ numbers without preserving the full emitted context.
 - Snapshot buffers are allocated and source snapshots are populated before
   timing. One serialize or restore call counts as one operation.
 - There is no separate warm-up pass. With multiple iterations, the executable
-  prints one complete table per iteration.
+  prints one complete table per iteration in text mode or one result object per
+  iteration in JSON mode.
 
 ## Workload Definitions
 

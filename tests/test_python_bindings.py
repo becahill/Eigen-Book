@@ -142,6 +142,104 @@ def test_lot_size_rejection_has_a_named_status() -> None:
     assert result.events_emitted == 1
 
 
+def test_book_config_lot_size_is_reachable_from_python() -> None:
+    book = make_book_config(lot_size=5)
+    engine = eb.MatchingEngine([make_instrument(book_config=book, lot_size=0)])
+    result = engine.dispatch(
+        make_add_command(
+            order_id=1,
+            side=eb.Side.BUY,
+            price=100,
+            quantity=1,
+        )
+    )
+
+    assert result.status == eb.Status.LOT_SIZE_VIOLATION
+    assert result.events_emitted == 1
+
+
+def test_venue_command_exposes_participant_and_post_only() -> None:
+    engine = eb.MatchingEngine([make_instrument()])
+    rest = eb.VenueCommand(
+        make_add_command(
+            order_id=1,
+            side=eb.Side.SELL,
+            price=100,
+            quantity=10,
+        ),
+        participant_id=7,
+    )
+    assert engine.dispatch(rest).status == eb.Status.ACCEPTED
+    checksum_before_reject = engine.state_checksum()
+
+    crossing = eb.VenueCommand(
+        make_add_command(
+            order_id=2,
+            side=eb.Side.BUY,
+            price=100,
+            quantity=1,
+        ),
+        participant_id=8,
+        post_only=True,
+    )
+    result = engine.dispatch(crossing)
+
+    assert result.status == eb.Status.POST_ONLY_WOULD_CROSS
+    assert result.events_emitted == 1
+    assert engine.state_checksum() == checksum_before_reject
+    top = engine.top_of_book(101)
+    assert top.ask.valid
+    assert top.ask.price == 100
+    assert top.ask.quantity == 10
+
+
+def test_stp_and_market_data_scalars_are_visible_from_python() -> None:
+    book = make_book_config(
+        self_trade_policy=eb.SelfTradePolicy.CANCEL_RESTING,
+        market_data_capacity=8,
+    )
+    engine = eb.MatchingEngine([make_instrument(book_config=book)])
+    mirror = eb.MatchingEngine([make_instrument(book_config=book)])
+    rest = eb.VenueCommand(
+        make_add_command(
+            order_id=1,
+            side=eb.Side.SELL,
+            price=100,
+            quantity=10,
+        ),
+        participant_id=7,
+    )
+
+    initial_checksum = engine.state_checksum()
+    result = engine.dispatch(rest)
+    mirror_result = mirror.dispatch(rest)
+
+    assert result.status == eb.Status.ACCEPTED
+    assert result.market_data_events_emitted == 2
+    assert engine.market_data_sequence(101) == 2
+    assert engine.state_checksum() != initial_checksum
+    assert mirror_result.status == result.status
+    assert mirror.state_checksum() == engine.state_checksum()
+
+    market = eb.Command()
+    market.instrument_id = 101
+    market.op = eb.CommandOp.MARKET
+    market.order_id = 2
+    market.side = eb.Side.BUY
+    market.quantity = 10
+    market.time_in_force = eb.TimeInForce.GTC
+    market.timestamp = 2
+
+    stp_result = engine.dispatch(eb.VenueCommand(market, participant_id=7))
+
+    assert stp_result.status == eb.Status.NO_LIQUIDITY
+    assert stp_result.resting_orders_cancelled_by_stp == 1
+    assert stp_result.market_data_events_emitted == 2
+    assert engine.market_data_sequence(101) == 4
+    assert engine.market_data_sequence(999) == 0
+    assert not engine.top_of_book(101).ask.valid
+
+
 def test_default_event_capacity_is_reported_by_native_engine() -> None:
     book = make_book_config(max_orders=16, event_log_capacity=0)
     engine = eb.MatchingEngine([make_instrument(book_config=book)])

@@ -52,6 +52,11 @@ jobs:
           ctest --test-dir "${{ matrix.build-dir }}" --output-on-failure
           --label-regex '^allocation$'
 
+      - name: Run installed-package consumer smoke
+        run: >
+          ctest --test-dir "${{ matrix.build-dir }}" --output-on-failure
+          --label-regex '^package$'
+
       - name: Run tests
         run: ctest --test-dir "${{ matrix.build-dir }}" --output-on-failure
 

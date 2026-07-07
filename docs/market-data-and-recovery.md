@@ -37,6 +37,13 @@ Initialize it with the sequence carried by a snapshot, then require
 `SequenceCheck::Contiguous`; `Gap`, `DuplicateOrOld`, and `WrongInstrument` are
 explicit outcomes.
 
+Python currently exposes market-data configuration and scalar observability
+only: `BookConfig.market_data_capacity`, `InstrumentConfig.market_data_capacity`,
+`DispatchResult.market_data_events_emitted`, and
+`MatchingEngine.market_data_sequence(instrument_id)`. It does not expose copied
+`MarketDataEvent` payload buffers or `SequenceGapDetector`; use C++ for
+incremental market-data payload streams.
+
 ## State checksum
 
 `OrderBook::state_checksum()` is canonical 64-bit FNV-1a over explicit
@@ -138,6 +145,10 @@ sequence, and after checksum. Any mismatch returns `ReplayDiverged`.
 The matching engine owns validation, mutation, bounded event/record production,
 sequence assignment, checksums, snapshot encoding/restore, and deterministic
 replay verification. It performs no file or network I/O.
+
+The Python package exposes `MatchingEngine.state_checksum()` for deterministic
+state comparison, but snapshot serialization/restore, journal record production,
+journal decode, and replay remain C++-only for now.
 
 An external persistence/transport component owns file creation, batching,
 flush/fsync policy, replication, retention, snapshot scheduling, record framing

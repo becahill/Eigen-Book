@@ -27,6 +27,13 @@ construction.
 Post-only is an instruction on limit add and replace, represented by the final
 `post_only` argument or by `VenueCommand::post_only`.
 
+Python exposes the same venue dispatch boundary through `VenueCommand`.
+Construct a normal `Command`, wrap it with `VenueCommand(command,
+participant_id=..., post_only=...)`, then pass the wrapper to
+`MatchingEngine.dispatch(...)` or the event-buffer dispatch methods. The
+direct C++ `add_limit_order`, `replace`, and `match_market_order` overloads
+remain C++-only.
+
 - Post-only is valid only with GTC. IOC/FOK combinations return
   `Status::InvalidPostOnlyTimeInForce`.
 - Any opposite best price that crosses the limit causes

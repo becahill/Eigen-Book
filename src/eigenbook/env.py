@@ -34,12 +34,17 @@ def _copy_instrument_config(
     book.tick_size = source_book.tick_size
     book.event_log_capacity = source_book.event_log_capacity
     book.price_level_mode = source_book.price_level_mode
+    book.lot_size = source_book.lot_size
+    book.self_trade_policy = source_book.self_trade_policy
+    book.market_data_capacity = source_book.market_data_capacity
 
     instrument = eb.InstrumentConfig()
     instrument.instrument_id = source.instrument_id
     instrument.book_config = book
     instrument.tick_size = source.tick_size
     instrument.lot_size = source.lot_size
+    instrument.self_trade_policy = source.self_trade_policy
+    instrument.market_data_capacity = source.market_data_capacity
     return instrument
 
 

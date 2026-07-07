@@ -24,26 +24,37 @@ set(EIGENBOOK_BENCHMARK_OPERATIONS "50000" CACHE STRING
     "Operations per workload in the run_benchmarks target")
 set(EIGENBOOK_BENCHMARK_ITERATIONS "1" CACHE STRING
     "Complete workload iterations in the run_benchmarks target")
+set(EIGENBOOK_BENCHMARK_FORMAT "text" CACHE STRING
+    "Output format for the run_benchmarks target: text or json")
+set_property(CACHE EIGENBOOK_BENCHMARK_FORMAT PROPERTY STRINGS text json)
+
+if(NOT EIGENBOOK_BENCHMARK_FORMAT MATCHES "^(text|json)$")
+    message(FATAL_ERROR "EIGENBOOK_BENCHMARK_FORMAT must be text or json")
+endif()
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
 endif()
 set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
 
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
 add_library(eigenbook INTERFACE)
 add_library(EigenBook::eigenbook ALIAS eigenbook)
 
 target_compile_features(eigenbook INTERFACE cxx_std_20)
 target_include_directories(eigenbook INTERFACE
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang|GNU")
     target_compile_options(eigenbook INTERFACE
-        -Wall
-        -Wextra
-        -Werror
-        $<$<CONFIG:Release>:-O3>
-        $<$<CONFIG:Release>:-march=native>)
+        $<BUILD_INTERFACE:-Wall>
+        $<BUILD_INTERFACE:-Wextra>
+        $<BUILD_INTERFACE:-Werror>
+        $<BUILD_INTERFACE:$<$<CONFIG:Release>:-O3>>
+        $<BUILD_INTERFACE:$<$<CONFIG:Release>:-march=native>>)
 
     set(EIGENBOOK_SANITIZERS "")
     if(EIGENBOOK_ENABLE_ASAN)
@@ -56,14 +67,52 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang|GNU")
     if(EIGENBOOK_SANITIZERS)
         list(JOIN EIGENBOOK_SANITIZERS "," EIGENBOOK_SANITIZER_FLAGS)
         target_compile_options(eigenbook INTERFACE
-            -fsanitize=${EIGENBOOK_SANITIZER_FLAGS}
-            -fno-omit-frame-pointer)
+            $<BUILD_INTERFACE:-fsanitize=${EIGENBOOK_SANITIZER_FLAGS}>
+            $<BUILD_INTERFACE:-fno-omit-frame-pointer>)
         target_link_options(eigenbook INTERFACE
-            -fsanitize=${EIGENBOOK_SANITIZER_FLAGS})
+            $<BUILD_INTERFACE:-fsanitize=${EIGENBOOK_SANITIZER_FLAGS}>)
     endif()
 elseif(EIGENBOOK_ENABLE_ASAN OR EIGENBOOK_ENABLE_UBSAN)
     message(WARNING "Sanitizers are only configured for Clang/GNU-like compilers")
 endif()
+
+set(EIGENBOOK_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/EigenBook"
+    CACHE STRING "Install directory for EigenBook CMake package files")
+
+configure_package_config_file(
+    cmake/EigenBookConfig.cmake.in
+    "${CMAKE_CURRENT_BINARY_DIR}/EigenBookConfig.cmake"
+    INSTALL_DESTINATION "${EIGENBOOK_INSTALL_CMAKEDIR}")
+
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/EigenBookConfigVersion.cmake"
+    VERSION "${PROJECT_VERSION}"
+    COMPATIBILITY SameMajorVersion
+    ARCH_INDEPENDENT)
+
+install(
+    TARGETS eigenbook
+    EXPORT EigenBookTargets)
+
+install(
+    DIRECTORY include/
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+    COMPONENT development
+    FILES_MATCHING PATTERN "*.hpp")
+
+install(
+    EXPORT EigenBookTargets
+    FILE EigenBookTargets.cmake
+    NAMESPACE EigenBook::
+    DESTINATION "${EIGENBOOK_INSTALL_CMAKEDIR}"
+    COMPONENT development)
+
+install(
+    FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/EigenBookConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/EigenBookConfigVersion.cmake"
+    DESTINATION "${EIGENBOOK_INSTALL_CMAKEDIR}"
+    COMPONENT development)
 
 include(CTest)
 
@@ -129,9 +178,23 @@ if(EIGENBOOK_BUILD_TESTS)
 
         add_test(NAME eigenbook_tests COMMAND eigenbook_tests)
         add_test(NAME eigenbook_no_allocation_tests COMMAND eigenbook_no_allocation_tests)
+        add_test(
+            NAME eigenbook_install_consumer_smoke
+            COMMAND "${CMAKE_COMMAND}"
+                "-DEIGENBOOK_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+                "-DEIGENBOOK_BUILD_CONFIG=$<CONFIG>"
+                "-DEIGENBOOK_CONSUMER_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake_consumer"
+                "-DEIGENBOOK_CONSUMER_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}/package-smoke/$<CONFIG>/consumer-build"
+                "-DEIGENBOOK_INSTALL_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/package-smoke/$<CONFIG>/install"
+                "-DEIGENBOOK_INSTALL_INCLUDEDIR=${CMAKE_INSTALL_INCLUDEDIR}"
+                "-DEIGENBOOK_INSTALL_CMAKEDIR=${EIGENBOOK_INSTALL_CMAKEDIR}"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake_consumer/verify_install_consumer.cmake")
         set_tests_properties(
             eigenbook_no_allocation_tests
             PROPERTIES LABELS allocation)
+        set_tests_properties(
+            eigenbook_install_consumer_smoke
+            PROPERTIES LABELS package)
     endif()
 endif()
 
@@ -164,6 +227,7 @@ if(EIGENBOOK_BUILD_BENCHMARKS)
         COMMAND $<TARGET_FILE:eigenbook_bench>
             --operations "${EIGENBOOK_BENCHMARK_OPERATIONS}"
             --iterations "${EIGENBOOK_BENCHMARK_ITERATIONS}"
+            --format "${EIGENBOOK_BENCHMARK_FORMAT}"
         DEPENDS eigenbook_bench
         COMMENT "Running reproducible Eigen-Book benchmark workloads"
         USES_TERMINAL

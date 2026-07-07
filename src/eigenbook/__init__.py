@@ -23,10 +23,12 @@ from ._eigenbook import (
     InstrumentConfig,
     MatchingEngine,
     PriceLevelMode,
+    SelfTradePolicy,
     Side,
     Status,
     TimeInForce,
     TopOfBook,
+    VenueCommand,
 )
 from ._version import __version__
 
@@ -56,10 +58,12 @@ __all__ = [
     "NATIVE_BUILD_TYPE",
     "NATIVE_COMPILER",
     "PriceLevelMode",
+    "SelfTradePolicy",
     "Side",
     "Status",
     "TimeInForce",
     "TopOfBook",
+    "VenueCommand",
     "__version__",
 ]
 

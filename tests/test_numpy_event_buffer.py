@@ -120,6 +120,30 @@ def test_partially_filled_event_buffer_is_a_caller_owned_copy() -> None:
     assert event_buffer[1]["trade"]["quantity"] == 5
 
 
+def test_venue_command_can_copy_events_to_buffer() -> None:
+    engine, event_buffer = make_engine_and_buffer()
+    command = eb.VenueCommand(
+        make_add_command(
+            order_id=1,
+            side=eb.Side.BUY,
+            price=100,
+            quantity=5,
+            timestamp=10,
+        ),
+        participant_id=7,
+        post_only=True,
+    )
+
+    result = engine.dispatch_result_with_buffer(command, event_buffer)
+
+    assert result.status == eb.Status.ACCEPTED
+    assert result.events_emitted == 2
+    assert event_buffer[0]["kind"] == 1
+    assert event_buffer[1]["kind"] == 2
+    assert event_buffer[1]["order_id"] == 1
+    assert event_buffer[1]["quantity"] == 5
+
+
 def test_empty_event_result_does_not_modify_buffer() -> None:
     engine, event_buffer = make_engine_and_buffer()
     event_buffer.view(np.uint8).fill(0xA5)
