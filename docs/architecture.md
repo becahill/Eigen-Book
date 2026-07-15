@@ -28,9 +28,9 @@ add_limit_order
 
 cancel_order
   |
-  +-- lookup id in OrderIdMap
+  +-- lookup id once in OrderIdMap and retain the erase token
   +-- unlink Order from its PriceLevel in O(1)
-  +-- erase id
+  +-- erase the located id and backward-shift its hash cluster
   +-- return Order to MemoryPool
   +-- emit OrderCancelled
   +-- return Status::Cancelled
@@ -88,7 +88,11 @@ Each `PriceLevel` stores:
 - head pointer
 - tail pointer
 
-Each `Order` stores `prev`, `next`, and `level` pointers plus timestamp, arrival sequence, side, and state metadata. The intrusive pointers make FIFO append, head execution, and arbitrary cancellation O(1) after lookup.
+Each `Order` stores `prev`, `next`, and `level` pointers plus timestamp, arrival
+sequence, side, and state metadata. The intrusive pointers make FIFO append,
+head execution, and the price-level unlink for arbitrary cancellation O(1).
+Hash deletion and best/slot maintenance have the separate configured bounds
+described below.
 
 The fill path updates aggregate quantity exactly once. If a fill reduces the front order to zero, the order is then unlinked with zero remaining quantity, avoiding double-subtraction.
 
@@ -105,13 +109,19 @@ Reasons for this design:
 - simple duplicate-id checks
 - bounded probe observability without sampling allocations
 
-Worst-case lookup probes are bounded by configured table capacity. Deletions
-leave tombstones so erase is O(1) after lookup and insertion can reuse deleted
-slots without rehashing. `OrderIdMap::stats()` reports size, capacity,
-tombstones, the last operation's probe count, and a fixed probe-count
-histogram. `OrderBook::stats()` exposes those metrics with order-pool
-utilization; `MatchingEngine::stats()` aggregates them across configured
-instruments.
+Worst-case lookup and erase compaction work is bounded by configured table
+capacity. Lookups stop on an empty slot, on a resident whose probe distance is
+shorter than the search distance (the Robin Hood early-miss condition), or
+after inspecting the full table. Deletions use backward-shift compaction:
+displaced entries move one slot toward home until an empty slot or a cluster
+boundary is reached. This preserves early-miss termination without persistent
+tombstones. `OrderIdMap::stats()` retains the tombstone field for API
+compatibility (it is always zero). For an erase, `last_probe_count` and its
+fixed histogram account for both lookup probes and entries moved by
+compaction. A lookup token lets cancellation and lose-priority replacement
+reuse the located slot instead of hashing and probing for the same id twice.
+`OrderBook::stats()` exposes those metrics with order-pool utilization;
+`MatchingEngine::stats()` aggregates them across configured instruments.
 
 Requested id-map capacity is rounded up to a power of two for mask-based indexing.
 Requests above the largest representable `std::uint32_t` power of two saturate at
@@ -162,6 +172,45 @@ Sparse mode keeps a cached best slot plus a sorted occupied-level slot array.
 When the current best level becomes empty, the next best is read directly from
 the sorted array. The bounded work in sparse mode is paid when creating or
 removing occupied levels, not while sweeping from best to next during matching.
+
+## Cancellation Complexity
+
+The intrusive FIFO unlink is O(1), but that is only one component of a complete
+cancellation. Let:
+
+- `C` be the normalized `OrderIdMap` capacity;
+- `H = min(C, max_orders)` be the maximum number of live entries that can
+  occupy one id-map cluster;
+- `L` be the dense configured price-level count and `W = ceil(L / 64)` its
+  occupancy-word count;
+- `K` be the number of occupied sparse levels before cancellation
+  (`K <= max_orders`); and
+- `M` be the sparse price-to-level map capacity reported by
+  `BookSideStats::level_map_capacity`.
+
+The retained erase token prevents a second id lookup. For a successful erase,
+the lookup path through the target and the backward-shift path after the target
+are disjoint portions of one Robin Hood cluster, including when that cluster
+wraps around the table. Their combined work is therefore bounded by `H`
+inspected-or-moved entries, plus constant bookkeeping. This bound is tight: a
+same-home cluster of `H` entries reaches it when its first entry is erased.
+
+Dense cancellation computes the level index and performs the intrusive unlink
+in constant time. If the order was the last order at the current best price,
+best-price maintenance scans at most `W` occupancy words; otherwise it is
+constant time. The complete dense cancellation is therefore `O(H + W)` (and
+hence `O(C + W)`), with at most `H + W` id-map entries or occupancy words
+inspected or moved, plus constant work.
+
+Sparse cancellation probes at most `M` price-map entries to locate the level,
+then unlinks in constant time. If the order was the level's last order, erasing
+the already-located price-map entry is constant time and removing its sorted
+slot shifts at most `K - 1` entries; the best slot is then refreshed in constant
+time. The complete sparse cancellation is therefore `O(H + M + K)` (and hence
+`O(C + M + K)`), bounded by `H + M + (K - 1)` id/price entries or sorted slots
+inspected or moved, plus constant bookkeeping. Sparse tombstones can make a
+negative price lookup inspect all `M` slots, but do not change that
+fixed-capacity bound.
 
 ## Matching Flow
 
@@ -407,12 +456,12 @@ implementation performs no heap allocation during serialize or restore after the
 target `OrderBook` or `MatchingEngine` has been constructed; restore rebuilds
 through the existing fixed `MemoryPool`, flat price levels, and fixed id map.
 
-Book snapshot format version `3` is a little-endian byte stream:
+Book snapshot format version `4` is a little-endian byte stream:
 
 ```text
 BookSnapshot
   magic: "EBOK"
-  version: u8 = 3
+  version: u8 = 4
   reserved: 3 bytes = 0
   instrument_id: u32
   BookConfig:
@@ -440,6 +489,8 @@ BookSnapshot
     sequence: u64
     participant_id: u64
     post_only: u8
+    initial_quantity: u64
+    state: u8
   level aggregates:
     side: u8
     price: i64 bits
@@ -469,12 +520,21 @@ from validated order and level records; aggregate, uniqueness, crossed-book,
 and FIFO checks prevent corrupt logical records from producing inconsistent
 derived metadata.
 
+`Order::initial_quantity` and `Order::state` are persistent public logical
+state. `initial_quantity` is the quantity with which the order most recently
+joined its resting FIFO (after any aggressive execution), and does not change
+on later fills or reductions. Live orders restore as their recorded `Resting`
+or `PartiallyFilled` state. A `Resting` order may have been explicitly reduced,
+so `initial_quantity >= quantity`; `PartiallyFilled` requires the strict
+`initial_quantity > quantity` relationship. Both fields participate in
+`state_checksum()`.
+
 Engine snapshots wrap a fixed-capacity array of instrument snapshots:
 
 ```text
 EngineSnapshot
   magic: "EBEN"
-  version: u8 = 3
+  version: u8 = 4
   reserved: 3 bytes = 0
   max_instruments: u32
   instrument_count: u32
@@ -547,6 +607,12 @@ The span is valid until the next mutating call on the same `OrderBook`. It does
 not own memory; callers that need longer retention should copy the events before
 submitting another command.
 
+This lifetime rule includes direct calls rejected before normal command-event
+emission: they clear or replace both the prior command-event span and the prior
+market-data span. Invalid encoded commands, invalid unified command enums, and
+unknown instruments do not route to an `OrderBook`, so they do not invalidate
+any configured book's spans.
+
 Event sequencing is monotonic per `EventLog`. Each `BookEvent` has a sequence,
 and trade events copy that same sequence into the nested `TradeEvent`.
 `BookEvent` and `TradeEvent` both carry `instrument_id`. Direct `OrderBook`
@@ -556,6 +622,13 @@ the incoming aggressor id, filled resting order id,
 aggressor side, execution price, execution quantity, timestamp, and sequence.
 Limit-order trades use the incoming limit id as `aggressor_id`. Market orders
 default to `kInvalidOrderId` unless the optional market aggressor id is passed.
+
+The sole unsequenced command event is the synchronous `OrderRejected` returned
+for `Status::PriceLevelQuantityOverflow`. It uses reserved sequence zero so an
+aggregate-overflow add or lose-priority replacement can report its exact cause
+while leaving FIFO, command-event, and market-data sequence checkpoints
+unchanged. The preflight runs before `OrderAccepted`, matching, order
+allocation, or removal of the replaced order.
 
 Accepted limit orders emit events in deterministic order:
 
@@ -601,7 +674,7 @@ automated allocation guard defines the matching hot path as:
 - fixed-capacity order and trade event emission, including ring wrap;
 - lot-size, post-only, and participant-aware STP paths;
 - fixed-capacity incremental market-data emission and capacity rejection;
-- bounded journal-record production and replay verification;
+- bounded journal-record generation and replay verification;
 - `MatchingEngine::dispatch(const Command&)` and encoded-command decode plus
   dispatch across dense and sparse instruments;
 - successful repeated command sequences and explicit rejection at order-pool,
@@ -689,9 +762,9 @@ contains a slow reference order book backed by ordinary STL containers. That
 oracle is intentionally not latency-oriented; it exists to make matching
 semantics easy to audit.
 
-The test harness drives both the production `OrderBook` and the reference model
-through hand-authored edge cases plus fixed-seed command streams. After every
-operation it checks:
+The test harness drives both the implementation `OrderBook` and the reference
+model through hand-authored edge cases plus fixed-seed command streams. After
+every operation it checks:
 
 - returned status/result fields
 - emitted event streams, including sequence, kind, status, trade attribution,

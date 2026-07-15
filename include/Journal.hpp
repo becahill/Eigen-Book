@@ -233,7 +233,11 @@ inline void encode_record(const JournalRecordInfo& record,
     write_u8(output, 38, static_cast<std::uint8_t>(command.time_in_force));
     write_u8(output, 39, record.venue_command.post_only ? 1U : 0U);
     write_u64(output, 40, command.order_id);
-    write_u64(output, 48, std::bit_cast<std::uint64_t>(command.price));
+    // Command has a stable packed wire layout. Copying its price into an
+    // aligned local avoids binding std::bit_cast's reference to that packed
+    // member while preserving the exact signed-price bit pattern.
+    const Price command_price = command.price;
+    write_u64(output, 48, std::bit_cast<std::uint64_t>(command_price));
     write_u64(output, 56, command.quantity);
     write_u64(output, 64, command.timestamp);
     write_u64(output, 72, record.venue_command.participant_id);
@@ -303,7 +307,7 @@ inline void encode_record(const JournalRecordInfo& record,
     record.venue_command.participant_id = read_u64(bytes, 72);
     const std::uint8_t status = read_u8(bytes, 80);
     if (record.journal_sequence == 0 || (flags & 0xfeU) != 0U ||
-        status > static_cast<std::uint8_t>(Status::ReplayDiverged) ||
+        status > static_cast<std::uint8_t>(Status::PriceLevelQuantityOverflow) ||
         !valid_command(record.venue_command)) {
         return Status::JournalInvalidField;
     }

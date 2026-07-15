@@ -50,6 +50,20 @@ cmake -S . -B build-benchmark-release \
 cmake --build build-benchmark-release --parallel --target run_benchmarks
 ```
 
+Multi-configuration generators do not use `CMAKE_BUILD_TYPE`. Select the
+configuration when building and running instead:
+
+```sh
+cmake -S . -B build-benchmark-multi -G "Ninja Multi-Config" \
+  -DEIGENBOOK_BUILD_BENCHMARKS=ON
+cmake --build build-benchmark-multi --config Release \
+  --parallel --target run_benchmarks
+```
+
+The generated benchmark metadata is configuration-specific. A Debug binary
+reports Debug and its Debug flags, while a Release binary reports Release and
+the Release flags actually configured for that compiler.
+
 For machine-readable output from an existing build, run the executable directly:
 
 ```sh
@@ -61,9 +75,18 @@ cmake --build build-benchmark-release --parallel --target eigenbook_bench
 
 The default text output prints its UTC start time, CPU model, OS/kernel,
 compiler and path, build type, optimization flags, CMake version/generator,
-iteration count, workload sizes, sampling block size, and units before any
-result rows. JSON output records the benchmark run context under `context`,
-with per-iteration rows under `results`.
+Git commit and dirty-worktree state, iteration count, workload sizes, sampling
+block size, and units before any result rows. Git provenance is captured when
+CMake configures the build; reconfigure after any worktree change before
+preserving a run. JSON output records the benchmark run context under
+`context`, with per-iteration rows under `results`. Its schema identifier is
+`eigenbook.benchmark.v2`; percentile fields are nullable as described below.
+
+A preserved benchmark record is complete only when it includes the Git commit
+and whether the configured worktree was dirty, in addition to the host,
+compiler, flags, timestamp, and workload. Legacy results that did not capture
+those fields must label them `not recorded` and are historical context only,
+not current release evidence.
 
 ## Python Boundary Benchmark
 
@@ -93,17 +116,25 @@ numbers without preserving the full emitted context.
 
 ## Measurement Method
 
-- Each timed row contains 50,000 operations in the recorded run below.
+- Normal timed rows contain 50,000 operations in the recorded run below;
+  snapshot-restore rows use the size-scaled counts documented with that
+  comparison.
 - Object construction, fixed-capacity engine storage, input vectors, setup
   liquidity, and latency-sample vectors are initialized before timing.
-- `std::chrono::steady_clock` measures blocks of 64 operations. Each block's
-  duration is divided by its operation count, then block values are sorted
-  outside the timed region for p50, p95, and p99.
+- `std::chrono::steady_clock` measures blocks of 64 operations. Each complete
+  block's duration is divided by 64, then the block values are sorted outside
+  the timed region for p50, p95, and p99.
 - Total time covers the operation loop, including per-block clock reads.
   Throughput and average latency are derived from that total.
-- Percentiles describe amortized block time, not independently timed
-  single-operation latency. The final partial block contains 16 operations
-  when the workload size is 50,000.
+- Percentiles use the nearest-rank rule: rank `ceil(p * sample_count)` in the
+  sorted complete-block samples. To retain at least one observation beyond the
+  reported tail, p50 requires 2 samples, p95 requires 20, and p99 requires 100.
+  Unsupported text fields report `unavailable`; JSON fields are `null`.
+- Percentiles describe amortized fixed-block time, not independently timed
+  single-operation latency. A final partial block still contributes to total
+  time and average latency but is excluded from percentile samples because it
+  has different averaging variance. The final partial block contains 16
+  operations when the workload size is 50,000.
 - Replay commands are encoded before timing. The timed operation decodes one
   39-byte command and dispatches it through `MatchingEngine`.
 - Snapshot buffers are allocated and source snapshots are populated before
@@ -119,9 +150,12 @@ numbers without preserving the full emitted context.
 | Scenario | Timed operation and pre-timed state |
 |---|---|
 | Add N limit orders | Add `N` non-crossing buy GTC orders of quantity 100 at prices 100-149. |
+| Add with venue checks | Add the same non-crossing flow with lot-size and self-trade-prevention configuration enabled and a distinct participant on each order. |
+| Add with market data | Add the same non-crossing flow while requiring a fixed-capacity market-data event for every operation. |
 | Dense wide 20 prices | Add `N` buy GTC orders of quantity 100 across 20 fixed prices from 10 to 950,000 in a dense `[1, 1,000,000]` book. |
 | Sparse wide 20 prices | Same flow and range as the dense-wide case, using fixed-capacity sparse price-level storage. |
 | Cancel N orders | Preload `N` buys at price 100 and quantity 100; cancel each by id. |
+| Clustered hash-map cancels | Preload `N` buys whose SplitMix64 hashes have six zero low bits into an id map sized for `N` entries, then cancel in insertion order. The restricted home buckets create collision clusters and expose lookup plus backward-shift deletion work. |
 | Modify N orders | Preload `N` buys at price 100 and quantity 100; reduce each quantity to 99 without losing priority. |
 | Replace N orders | Preload `N` buys at price 100 and quantity 100; replace each at price 101 and quantity 100. |
 | Match market orders | Preload `N` sells at price 100 and quantity 1; submit `N` buy market orders of quantity 1. |
@@ -198,6 +232,8 @@ Run context printed by the executable:
 | Build | CMake Release |
 | Optimization flags | `-O3 -DNDEBUG -O3 -march=native` |
 | CMake | 4.3.2, Unix Makefiles |
+| Git commit | Not recorded (legacy run) |
+| Dirty worktree | Not recorded (legacy run) |
 | Iterations | 1 complete iteration |
 | Workload size | 50,000 operations per row |
 | Sampling | 64 operations per latency sample |
@@ -221,7 +257,10 @@ Run context printed by the executable:
 | Serialize book snapshot       |      50000 |    148.165 |         337461 |   2963.3 |   2985 |   3080 |   3173 |
 ```
 
-These are one local run, not portable latency guarantees.
+These are one local run, not portable latency guarantees. They predate the
+built-in Git-provenance fields and are retained unchanged as historical
+measurements; they have not been rerun or relabeled by this documentation
+update.
 
 ## Matching-Engine Construction Contract Comparison
 
@@ -250,6 +289,8 @@ cmake --build <build-directory> --parallel \
 | Compiler path | `/usr/bin/c++` |
 | CMake | 4.3.2, Unix Makefiles |
 | Build/flags | Release; `-O3 -DNDEBUG -O3 -march=native` |
+| Git commits | Not recorded (legacy comparison) |
+| Dirty worktrees | Not recorded (legacy comparison) |
 | Before timestamp | 2026-06-26T21:31:57Z |
 | After timestamp | 2026-06-26T21:42:06Z |
 | Workload | 50,000 pre-encoded mixed commands per iteration |
@@ -291,6 +332,8 @@ cmake --build <build-directory> --parallel --target eigenbook_bench
 | Compiler path | `/usr/bin/c++` |
 | CMake | 4.3.2, Unix Makefiles |
 | Build/flags | Release; `-O3 -DNDEBUG -O3 -march=native` |
+| Git commits | Not recorded (legacy comparison) |
+| Dirty worktrees | Not recorded (legacy comparison) |
 | Before timestamp | 2026-06-26T21:15:25Z |
 | After timestamp | 2026-06-26T21:26:50Z |
 | Workload | Dense `[1, 8192]` book; 4,096 order slots; 8,192 id-map slots; one occupied level per order |
@@ -315,13 +358,15 @@ CI thresholds.
 
 ## Venue, Market-Data, and Recovery Change (2026-06-26)
 
-The production-semantics change was measured locally before and after on the
+The venue-semantics change was measured locally before and after on the
 same checkout and machine:
 
 - Apple M4, Darwin 25.5.0 arm64
 - AppleClang 21.0.0.21000101
 - CMake 4.3.2, Unix Makefiles
 - Release: `-O3 -DNDEBUG -O3 -march=native`
+- Git commits: not recorded (legacy comparison)
+- Dirty worktrees: not recorded (legacy comparison)
 - 20,000 operations per workload, three complete iterations
 - 64-operation latency sample blocks
 
@@ -352,7 +397,9 @@ Disabled market data branches before level/best-quote capture and uses the
 legacy matching loop. Cancel and modify are neutral within run noise. Remaining
 disabled-feature cost is concentrated in entry/replace preflight, wider order
 state (participant/post-only), STP-capable result handling, and the larger v3
-snapshot record. The regressions are recorded rather than hidden; a future
+snapshot record used by that historical run. Snapshot v4 is larger again
+because it persists public order quantity/state metadata; no v4 performance
+numbers are claimed here. The regressions are recorded rather than hidden; a future
 optimization pass should use randomized scenario order or process-isolated
 fixtures before making stronger causal claims.
 
@@ -375,7 +422,7 @@ fixtures before making stronger causal claims.
   warmer instruction/data caches. Separate process runs are appropriate when
   cold-start effects matter.
 - Block timing amortizes clock overhead but hides within-block outliers.
-- The workloads are deterministic synthetic microbenchmarks, not a production
+- The workloads are deterministic synthetic microbenchmarks, not a live
   exchange feed, multi-thread contention test, or end-to-end network latency
   measurement.
 - Snapshot restore includes validation, fixed-capacity clearing, and rebuilding

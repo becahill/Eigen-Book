@@ -11,7 +11,7 @@
 
 namespace eigenbook {
 
-inline constexpr std::uint8_t kSnapshotFormatVersion = 3;
+inline constexpr std::uint8_t kSnapshotFormatVersion = 4;
 
 template <std::uint32_t MaxOrders, std::uint32_t MaxLevels>
 struct BookSnapshot final {
@@ -137,7 +137,8 @@ struct SnapshotAccess final {
 
 namespace detail {
 
-inline constexpr std::size_t kBookOrderWireSize = 8 + 1 + 8 + 8 + 8 + 8 + 8 + 1;
+inline constexpr std::size_t kBookOrderWireSize =
+    8 + 1 + 8 + 8 + 8 + 8 + 8 + 1 + 8 + 1;
 inline constexpr std::size_t kLevelWireSize = 1 + 8 + 8 + 4;
 inline constexpr std::size_t kConfigWireSize = 8 + 8 + 4 + 4 + 8 + 4 + 1 + 8 + 1 + 4;
 inline constexpr std::size_t kInstrumentConfigWireSize = 4 + kConfigWireSize + 8 + 8 + 1 + 4;
@@ -427,21 +428,27 @@ inline void write_order(SnapshotWriter& writer, const BookSnapshotOrder& order) 
     writer.write_u64(order.sequence);
     writer.write_u64(order.participant_id);
     writer.write_u8(order.post_only ? 1U : 0U);
+    writer.write_u64(order.initial_quantity);
+    writer.write_u8(static_cast<std::uint8_t>(order.state));
 }
 
 [[nodiscard]] inline bool read_order(SnapshotReader& reader, BookSnapshotOrder& order) noexcept
 {
     std::uint8_t side = 0;
     std::uint8_t post_only = 0;
+    std::uint8_t state = 0;
     if (!reader.read_u64(order.id) || !reader.read_u8(side) || side > static_cast<std::uint8_t>(Side::Sell) ||
         !reader.read_price(order.price) || !reader.read_u64(order.quantity) ||
         !reader.read_u64(order.timestamp) || !reader.read_u64(order.sequence) ||
-        !reader.read_u64(order.participant_id) || !reader.read_u8(post_only) || post_only > 1U) {
+        !reader.read_u64(order.participant_id) || !reader.read_u8(post_only) || post_only > 1U ||
+        !reader.read_u64(order.initial_quantity) || !reader.read_u8(state) ||
+        state > static_cast<std::uint8_t>(OrderState::Cancelled)) {
         return false;
     }
 
     order.side = static_cast<Side>(side);
     order.post_only = post_only != 0;
+    order.state = static_cast<OrderState>(state);
     return true;
 }
 
@@ -607,7 +614,14 @@ inline void write_level(SnapshotWriter& writer, const BookSnapshotLevelAggregate
             header.orders_offset + static_cast<std::size_t>(order_index) * kBookOrderWireSize;
         if (!read_order_at(buffer, offset, order) || order.id == kInvalidOrderId ||
             !valid_side(order.side) || order.quantity == 0 ||
-            (header.config.lot_size > 1U && order.quantity % header.config.lot_size != 0U) ||
+            order.initial_quantity < order.quantity ||
+            (order.state != OrderState::Resting &&
+             order.state != OrderState::PartiallyFilled) ||
+            (order.state == OrderState::PartiallyFilled &&
+             order.initial_quantity == order.quantity) ||
+            (header.config.lot_size > 1U &&
+             (order.quantity % header.config.lot_size != 0U ||
+              order.initial_quantity % header.config.lot_size != 0U)) ||
             !valid_price_for_config(header.config, order.price) || order.sequence == 0 ||
             order.sequence > header.next_sequence) {
             return Status::SnapshotFormatMismatch;
@@ -770,6 +784,8 @@ inline void write_book_snapshot(const OrderBook& book, SnapshotWriter& writer) n
                         order.sequence,
                         order.participant_id,
                         order.post_only,
+                        order.initial_quantity,
+                        order.state,
                     });
     });
 

@@ -142,6 +142,25 @@ def test_lot_size_rejection_has_a_named_status() -> None:
     assert result.events_emitted == 1
 
 
+def test_market_lot_rejection_preserves_requested_quantity() -> None:
+    engine = eb.MatchingEngine([make_instrument(lot_size=5)])
+    command = make_add_command(
+        order_id=1,
+        side=eb.Side.BUY,
+        price=0,
+        quantity=3,
+    )
+    command.op = eb.CommandOp.MARKET
+
+    result = engine.dispatch(command)
+
+    assert result.status == eb.Status.LOT_SIZE_VIOLATION
+    assert result.requested_quantity == 3
+    assert result.executed_quantity == 0
+    assert result.remaining_quantity == 3
+    assert result.events_emitted == 1
+
+
 def test_book_config_lot_size_is_reachable_from_python() -> None:
     book = make_book_config(lot_size=5)
     engine = eb.MatchingEngine([make_instrument(book_config=book, lot_size=0)])
@@ -238,6 +257,94 @@ def test_stp_and_market_data_scalars_are_visible_from_python() -> None:
     assert engine.market_data_sequence(101) == 4
     assert engine.market_data_sequence(999) == 0
     assert not engine.top_of_book(101).ask.valid
+
+
+@pytest.mark.parametrize(
+    ("policy", "aggressor_cancelled", "resting_cancelled"),
+    [
+        (eb.SelfTradePolicy.CANCEL_AGGRESSOR, True, 0),
+        (eb.SelfTradePolicy.CANCEL_RESTING, False, 1),
+        (eb.SelfTradePolicy.CANCEL_BOTH, True, 1),
+    ],
+    ids=("cancel-aggressor", "cancel-resting", "cancel-both"),
+)
+@pytest.mark.parametrize("operation", ("limit-add", "replace", "market"))
+def test_stp_outcomes_survive_python_dispatch(
+    policy: eb.SelfTradePolicy,
+    aggressor_cancelled: bool,
+    resting_cancelled: int,
+    operation: str,
+) -> None:
+    book = make_book_config(self_trade_policy=policy)
+    engine = eb.MatchingEngine([make_instrument(book_config=book)])
+    participant_id = 7
+
+    resting = eb.VenueCommand(
+        make_add_command(
+            order_id=1,
+            side=eb.Side.SELL,
+            price=100,
+            quantity=10,
+        ),
+        participant_id=participant_id,
+    )
+    assert engine.dispatch(resting).status == eb.Status.ACCEPTED
+
+    if operation == "replace":
+        replace_target = eb.VenueCommand(
+            make_add_command(
+                order_id=2,
+                side=eb.Side.BUY,
+                price=99,
+                quantity=10,
+                timestamp=2,
+            ),
+            participant_id=participant_id,
+        )
+        assert engine.dispatch(replace_target).status == eb.Status.ACCEPTED
+
+        command = make_add_command(
+            order_id=2,
+            side=eb.Side.BUY,
+            price=100,
+            quantity=10,
+            timestamp=3,
+        )
+        command.op = eb.CommandOp.REPLACE
+        result = engine.dispatch(command)
+    elif operation == "market":
+        command = make_add_command(
+            order_id=2,
+            side=eb.Side.BUY,
+            price=0,
+            quantity=10,
+            timestamp=2,
+        )
+        command.op = eb.CommandOp.MARKET
+        result = engine.dispatch(
+            eb.VenueCommand(command, participant_id=participant_id)
+        )
+    else:
+        command = make_add_command(
+            order_id=2,
+            side=eb.Side.BUY,
+            price=100,
+            quantity=10,
+            timestamp=2,
+        )
+        result = engine.dispatch(
+            eb.VenueCommand(command, participant_id=participant_id)
+        )
+
+    if policy == eb.SelfTradePolicy.CANCEL_RESTING:
+        expected_status = (
+            eb.Status.NO_LIQUIDITY if operation == "market" else eb.Status.ACCEPTED
+        )
+    else:
+        expected_status = eb.Status.SELF_TRADE_PREVENTED
+    assert result.status == expected_status
+    assert result.aggressor_cancelled_by_stp is aggressor_cancelled
+    assert result.resting_orders_cancelled_by_stp == resting_cancelled
 
 
 def test_default_event_capacity_is_reported_by_native_engine() -> None:

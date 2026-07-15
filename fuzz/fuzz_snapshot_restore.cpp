@@ -93,7 +93,11 @@ inline constexpr std::size_t kSnapshotBufferSize = 4096;
         const Order* const live_order = book.find_order(order.id);
         if (live_order == nullptr || live_order->side != order.side || live_order->price != order.price ||
             live_order->quantity != order.quantity || live_order->timestamp != order.timestamp ||
-            live_order->sequence != order.sequence) {
+            live_order->sequence != order.sequence ||
+            live_order->participant_id != order.participant_id ||
+            live_order->post_only != order.post_only ||
+            live_order->initial_quantity != order.initial_quantity ||
+            live_order->state != order.state) {
             return false;
         }
 

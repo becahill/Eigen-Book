@@ -376,7 +376,8 @@ void bind_enums(py::module_& module)
         .value("JOURNAL_LENGTH_MISMATCH", Status::JournalLengthMismatch)
         .value("JOURNAL_CHECKSUM_MISMATCH", Status::JournalChecksumMismatch)
         .value("JOURNAL_INVALID_FIELD", Status::JournalInvalidField)
-        .value("REPLAY_DIVERGED", Status::ReplayDiverged);
+        .value("REPLAY_DIVERGED", Status::ReplayDiverged)
+        .value("PRICE_LEVEL_QUANTITY_OVERFLOW", Status::PriceLevelQuantityOverflow);
 }
 
 void bind_configuration(py::module_& module)

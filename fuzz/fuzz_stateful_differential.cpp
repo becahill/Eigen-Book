@@ -62,6 +62,7 @@ private:
 
 struct DecodedCommand final {
     Command command{};
+    VenueCommand venue_command{};
     bool force_snapshot{false};
     bool test_corrupt_snapshot{false};
     std::uint8_t mutation_selector{0};
@@ -200,6 +201,20 @@ struct HarnessConfig final {
     }
 }
 
+[[nodiscard]] ParticipantId decode_participant_id(const std::uint8_t value) noexcept
+{
+    switch ((value >> 5U) & 0x03U) {
+    case 0:
+        return kAnonymousParticipantId;
+    case 1:
+        return 7;
+    case 2:
+        return 42;
+    default:
+        return 1U + static_cast<ParticipantId>(value % 3U);
+    }
+}
+
 [[nodiscard]] bool decode_command(InputReader& reader,
                                   const BookConfig& config,
                                   DecodedCommand& decoded) noexcept
@@ -245,6 +260,11 @@ struct HarnessConfig final {
         decode_quantity(quantity, config.max_orders),
         time_in_force[static_cast<std::size_t>(tif) % time_in_force.size()],
         static_cast<Timestamp>(timestamp),
+    };
+    decoded.venue_command = VenueCommand{
+        decoded.command,
+        decode_participant_id(mutation),
+        (mutation & 0x10U) != 0U,
     };
     decoded.force_snapshot = (control & 0x80U) != 0U;
     decoded.test_corrupt_snapshot = (control & 0x40U) != 0U;
@@ -661,6 +681,211 @@ void execute_command(MatchingEngine& dense,
     }
 }
 
+void check_market_data_event_equal(const MarketDataEvent& actual,
+                                   const MarketDataEvent& expected)
+{
+    CHECK(actual.kind == expected.kind);
+    CHECK(actual.instrument_id == expected.instrument_id);
+    CHECK(actual.sequence == expected.sequence);
+    CHECK(actual.side == expected.side);
+    CHECK(actual.price == expected.price);
+    CHECK(actual.previous_quantity == expected.previous_quantity);
+    CHECK(actual.quantity == expected.quantity);
+    CHECK(actual.order_count == expected.order_count);
+    CHECK(actual.aggressor_id == expected.aggressor_id);
+    CHECK(actual.resting_id == expected.resting_id);
+    CHECK(actual.trade_quantity == expected.trade_quantity);
+    CHECK(actual.timestamp == expected.timestamp);
+}
+
+void check_market_data_events_equal(const std::span<const MarketDataEvent> actual,
+                                    const std::span<const MarketDataEvent> expected)
+{
+    CHECK(actual.size() == expected.size());
+    for (std::size_t index = 0; index < actual.size(); ++index) {
+        check_market_data_event_equal(actual[index], expected[index]);
+    }
+}
+
+void check_venue_dispatch_results_equal(const DispatchResult& actual,
+                                        const DispatchResult& expected)
+{
+    check_dispatch_results_equal(actual, expected, "venue_dense_sparse_dispatch");
+    CHECK(actual.aggressor_cancelled_by_stp == expected.aggressor_cancelled_by_stp);
+    CHECK(actual.resting_orders_cancelled_by_stp ==
+          expected.resting_orders_cancelled_by_stp);
+    CHECK(actual.market_data_events_emitted == actual.market_data_events.size());
+    CHECK(expected.market_data_events_emitted == expected.market_data_events.size());
+    CHECK(actual.market_data_events_emitted == expected.market_data_events_emitted);
+    check_market_data_events_equal(actual.market_data_events, expected.market_data_events);
+}
+
+void check_venue_book_equal(const OrderBook& actual, const OrderBook& expected)
+{
+    CHECK(actual.instrument_id() == expected.instrument_id());
+    CHECK(actual.live_order_count() == expected.live_order_count());
+    CHECK(actual.fifo_sequence() == expected.fifo_sequence());
+    CHECK(actual.event_sequence() == expected.event_sequence());
+    CHECK(actual.market_data_sequence() == expected.market_data_sequence());
+    CHECK(actual.state_checksum() == expected.state_checksum());
+
+    const BookConfig& actual_config = actual.config();
+    const BookConfig& expected_config = expected.config();
+    CHECK(actual_config.min_price == expected_config.min_price);
+    CHECK(actual_config.max_price == expected_config.max_price);
+    CHECK(actual_config.max_orders == expected_config.max_orders);
+    CHECK(actual_config.order_id_map_capacity == expected_config.order_id_map_capacity);
+    CHECK(actual_config.tick_size == expected_config.tick_size);
+    CHECK(actual_config.event_log_capacity == expected_config.event_log_capacity);
+    CHECK(actual_config.lot_size == expected_config.lot_size);
+    CHECK(actual_config.self_trade_policy == expected_config.self_trade_policy);
+    CHECK(actual_config.market_data_capacity == expected_config.market_data_capacity);
+
+    check_best_quote(actual.best_bid(), expected.best_bid(), "venue_best_bid");
+    check_best_quote(actual.best_ask(), expected.best_ask(), "venue_best_ask");
+
+    for (const Side side : {Side::Buy, Side::Sell}) {
+        std::array<DepthLevel, 16> actual_depth{};
+        std::array<DepthLevel, 16> expected_depth{};
+        const std::uint32_t actual_count =
+            actual.depth(side,
+                         static_cast<std::uint32_t>(actual_depth.size()),
+                         actual_depth.data());
+        const std::uint32_t expected_count =
+            expected.depth(side,
+                           static_cast<std::uint32_t>(expected_depth.size()),
+                           expected_depth.data());
+        CHECK(actual_count == expected_count);
+        for (std::uint32_t index = 0; index < actual_count; ++index) {
+            CHECK(actual_depth[index].price == expected_depth[index].price);
+            CHECK(actual_depth[index].aggregate_quantity ==
+                  expected_depth[index].aggregate_quantity);
+            CHECK(actual_depth[index].order_count == expected_depth[index].order_count);
+        }
+    }
+
+    for (OrderId id = 0; id <= kMaxDecodedOrderId; ++id) {
+        const Order* const actual_order = actual.find_order(id);
+        const Order* const expected_order = expected.find_order(id);
+        CHECK((actual_order == nullptr) == (expected_order == nullptr));
+        if (actual_order == nullptr) {
+            continue;
+        }
+
+        CHECK(actual_order->id == expected_order->id);
+        CHECK(actual_order->side == expected_order->side);
+        CHECK(actual_order->price == expected_order->price);
+        CHECK(actual_order->quantity == expected_order->quantity);
+        CHECK(actual_order->timestamp == expected_order->timestamp);
+        CHECK(actual_order->sequence == expected_order->sequence);
+        CHECK(actual_order->participant_id == expected_order->participant_id);
+        CHECK(actual_order->post_only == expected_order->post_only);
+        CHECK(actual_order->initial_quantity == expected_order->initial_quantity);
+        CHECK(actual_order->state == expected_order->state);
+        CHECK(actual_order->active == expected_order->active);
+        CHECK(actual_order->level != nullptr);
+        CHECK(expected_order->level != nullptr);
+        CHECK((actual_order->prev == nullptr) == (expected_order->prev == nullptr));
+        CHECK((actual_order->next == nullptr) == (expected_order->next == nullptr));
+        if (actual_order->prev != nullptr) {
+            CHECK(actual_order->prev->id == expected_order->prev->id);
+        }
+        if (actual_order->next != nullptr) {
+            CHECK(actual_order->next->id == expected_order->next->id);
+        }
+    }
+
+    check_event_stream(actual.last_events(), expected.last_events(), "venue_book_events");
+    check_market_data_events_equal(actual.last_market_data_events(),
+                                   expected.last_market_data_events());
+    const std::span<const MarketDataEvent> market_data = actual.last_market_data_events();
+    if (!market_data.empty()) {
+        CHECK(market_data.front().instrument_id == actual.instrument_id());
+        CHECK(market_data.back().sequence == actual.market_data_sequence());
+        for (std::size_t index = 1; index < market_data.size(); ++index) {
+            CHECK(market_data[index].instrument_id == actual.instrument_id());
+            CHECK(market_data[index].sequence == market_data[index - 1U].sequence + 1U);
+        }
+    }
+}
+
+void check_venue_engines_equal(const MatchingEngine& dense,
+                               const MatchingEngine& sparse)
+{
+    CHECK(dense.valid());
+    CHECK(sparse.valid());
+    CHECK(dense.instrument_count() == 2U);
+    CHECK(sparse.instrument_count() == 2U);
+    CHECK(dense.state_checksum() == sparse.state_checksum());
+    for (const InstrumentId instrument_id : {kInstrumentA, kInstrumentB}) {
+        const OrderBook* const dense_book = dense.order_book(instrument_id);
+        const OrderBook* const sparse_book = sparse.order_book(instrument_id);
+        CHECK(dense_book != nullptr);
+        CHECK(sparse_book != nullptr);
+        check_venue_book_equal(*dense_book, *sparse_book);
+    }
+}
+
+[[nodiscard]] std::array<InstrumentConfig, 2> venue_configs(
+    const BookConfig& base,
+    const PriceLevelMode mode,
+    const SelfTradePolicy policy) noexcept
+{
+    BookConfig instrument_a = base;
+    instrument_a.price_level_mode = mode;
+    instrument_a.event_log_capacity = 128;
+    instrument_a.lot_size = 2;
+    instrument_a.self_trade_policy = policy;
+    instrument_a.market_data_capacity = 128;
+
+    BookConfig instrument_b = instrument_a;
+    instrument_b.lot_size = 5;
+    return {{
+        InstrumentConfig{kInstrumentA, instrument_a},
+        InstrumentConfig{kInstrumentB, instrument_b},
+    }};
+}
+
+class VenueLane final {
+public:
+    VenueLane(const BookConfig& base, const SelfTradePolicy policy)
+        : dense_configs_(venue_configs(base, PriceLevelMode::Dense, policy)),
+          sparse_configs_(venue_configs(base, PriceLevelMode::Sparse, policy)),
+          dense_(std::span<const InstrumentConfig>(dense_configs_)),
+          sparse_(std::span<const InstrumentConfig>(sparse_configs_))
+    {
+        CHECK(dense_.valid());
+        CHECK(sparse_.valid());
+        check_venue_engines_equal(dense_, sparse_);
+    }
+
+    void execute(const VenueCommand& command, const std::uint32_t command_index)
+    {
+        const DispatchResult dense_result = dense_.dispatch(command);
+        const DispatchResult sparse_result = sparse_.dispatch(command);
+        if (dense_result.status != sparse_result.status) {
+            std::fprintf(stderr,
+                         "venue-command=%u policy=%u op=%u instrument=%u id=%llu "
+                         "participant=%llu post_only=%u\n",
+                         command_index,
+                         static_cast<unsigned>(dense_configs_[0].book_config.self_trade_policy),
+                         static_cast<unsigned>(command.command.op),
+                         command.command.instrument_id,
+                         static_cast<unsigned long long>(command.command.order_id),
+                         static_cast<unsigned long long>(command.participant_id),
+                         command.post_only ? 1U : 0U);
+        }
+        check_venue_dispatch_results_equal(dense_result, sparse_result);
+        check_venue_engines_equal(dense_, sparse_);
+    }
+
+private:
+    std::array<InstrumentConfig, 2> dense_configs_{};
+    std::array<InstrumentConfig, 2> sparse_configs_{};
+    MatchingEngine dense_;
+    MatchingEngine sparse_;
+};
+
 } // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, const std::size_t size)
@@ -689,6 +914,10 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, const std::size_
     MatchingEngine restored_sparse(sparse_configs);
     ReferenceOrderBook reference_a(config.dense, kInstrumentA);
     ReferenceOrderBook reference_b(config.dense, kInstrumentB);
+    VenueLane venue_disabled(config.dense, SelfTradePolicy::Disabled);
+    VenueLane venue_cancel_aggressor(config.dense, SelfTradePolicy::CancelAggressor);
+    VenueLane venue_cancel_resting(config.dense, SelfTradePolicy::CancelResting);
+    VenueLane venue_cancel_both(config.dense, SelfTradePolicy::CancelBoth);
     CHECK(dense.valid());
     CHECK(sparse.valid());
     CHECK(restored_dense.valid());
@@ -727,6 +956,10 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, const std::size_
                         reference_b,
                         decoded.command,
                         command_index);
+        venue_disabled.execute(decoded.venue_command, command_index);
+        venue_cancel_aggressor.execute(decoded.venue_command, command_index);
+        venue_cancel_resting.execute(decoded.venue_command, command_index);
+        venue_cancel_both.execute(decoded.venue_command, command_index);
         ++command_index;
     }
 

@@ -48,8 +48,13 @@ public:
                                                  const bool post_only = false) noexcept
     {
         AddOrderResult result{};
-        result.accepted_quantity = quantity;
         begin_operation();
+        if (side != Side::Buy && side != Side::Sell) {
+            result.status = Status::InvalidCommand;
+            return finish_result(result);
+        }
+
+        result.accepted_quantity = quantity;
 
         const Status validation_status = validate_new_order(id, price, quantity);
         if (validation_status != Status::Accepted) {
@@ -89,6 +94,7 @@ public:
             return finish_result(result);
         }
 
+        BookSide& same_side = side == Side::Buy ? bids_ : asks_;
         BookSide& contra_side = side == Side::Buy ? asks_ : bids_;
         const Quantity crossing_quantity = contra_side.executable_quantity(quantity, true, price);
         if (post_only && crossing_quantity != 0) {
@@ -119,6 +125,28 @@ public:
             }
             emit_order_rejected(id, side, price, quantity, timestamp, time_in_force, result.status);
             return finish_result(result);
+        }
+
+        if (time_in_force == TimeInForce::Gtc && executable_quantity < quantity &&
+            !preflight.aggressor_cancelled) {
+            const Quantity residual_quantity = quantity - executable_quantity;
+            const Status level_status =
+                same_side.can_accept_residual(price, residual_quantity);
+            if (level_status != Status::Accepted) {
+                result.accepted_quantity = 0;
+                result.status = level_status;
+                if (!start_event_operation(1)) {
+                    return event_log_full_result(result);
+                }
+                emit_preflight_order_rejected(id,
+                                              side,
+                                              price,
+                                              quantity,
+                                              timestamp,
+                                              time_in_force,
+                                              level_status);
+                return finish_result(result);
+            }
         }
 
         // Bounded preflight avoids partially executing an order that cannot
@@ -165,6 +193,9 @@ public:
         result.fills = match_result.fills;
         result.has_last_price = match_result.has_last_price;
         result.last_price = match_result.last_price;
+        result.aggressor_cancelled_by_stp = match_result.aggressor_cancelled_by_stp;
+        result.resting_orders_cancelled_by_stp =
+            match_result.resting_orders_cancelled_by_stp;
 
         if (match_result.status == Status::InternalError) {
             result.status = Status::InternalError;
@@ -226,7 +257,6 @@ public:
                      participant_id,
                      post_only);
 
-        BookSide& same_side = side == Side::Buy ? bids_ : asks_;
         Quantity previous_level_quantity = 0;
         BestQuote previous_best{};
         if (market_data_.enabled()) {
@@ -278,7 +308,8 @@ public:
     {
         CancelResult result{};
         begin_operation();
-        Order* order = order_ids_.find(id);
+        const OrderIdMap::EraseToken erase_token = order_ids_.find_for_erase(id);
+        Order* const order = erase_token.order();
         if (order == nullptr) {
             result.status = Status::UnknownOrderId;
             if (!start_event_operation(1)) {
@@ -311,7 +342,7 @@ public:
             return finish_result(result);
         }
 
-        static_cast<void>(order_ids_.erase(id));
+        static_cast<void>(order_ids_.erase(erase_token));
         order->state = OrderState::Cancelled;
         order->clear();
         orders_.release(order);
@@ -468,7 +499,8 @@ public:
         result.new_quantity = new_quantity;
         begin_operation();
 
-        Order* order = order_ids_.find(id);
+        const OrderIdMap::EraseToken erase_token = order_ids_.find_for_erase(id);
+        Order* const order = erase_token.order();
         if (order == nullptr) {
             result.status = Status::UnknownOrderId;
             if (!start_event_operation(1)) {
@@ -655,16 +687,15 @@ public:
                 if (!start_event_operation(1)) {
                     return event_log_full_result(result);
                 }
-                event_log_.append_order(BookEvent::Kind::OrderRejected,
-                                        result.status,
-                                        id,
-                                        side_value,
-                                        new_price,
-                                        new_quantity,
-                                        timestamp,
-                                        time_in_force,
-                                        old_quantity,
-                                        new_quantity);
+                emit_preflight_order_rejected(id,
+                                              side_value,
+                                              new_price,
+                                              new_quantity,
+                                              timestamp,
+                                              time_in_force,
+                                              result.status,
+                                              old_quantity,
+                                              new_quantity);
                 return finish_result(result);
             }
         }
@@ -701,7 +732,7 @@ public:
             return finish_result(result);
         }
 
-        static_cast<void>(order_ids_.erase(id));
+        static_cast<void>(order_ids_.erase(erase_token));
         if (market_data_.enabled()) {
             emit_market_data_level_change(&market_data_,
                                           side_value,
@@ -743,6 +774,9 @@ public:
         result.fills = match_result.fills;
         result.has_last_price = match_result.has_last_price;
         result.last_price = match_result.last_price;
+        result.aggressor_cancelled_by_stp = match_result.aggressor_cancelled_by_stp;
+        result.resting_orders_cancelled_by_stp =
+            match_result.resting_orders_cancelled_by_stp;
 
         if (match_result.status == Status::InternalError) {
             order->clear();
@@ -861,9 +895,16 @@ public:
                                                  const ParticipantId participant_id =
                                                      kAnonymousParticipantId) noexcept
     {
+        MatchResult result{};
+        result.requested_quantity = quantity;
+        result.remaining_quantity = quantity;
         begin_operation();
+        if (aggressor_side != Side::Buy && aggressor_side != Side::Sell) {
+            result.status = Status::InvalidCommand;
+            return finish_result(result);
+        }
+
         if (!valid_lot_quantity(quantity)) {
-            MatchResult result{};
             result.status = quantity == 0 ? Status::InvalidQuantity : Status::LotSizeViolation;
             if (!start_event_operation(1)) {
                 return event_log_full_result(result);
@@ -886,26 +927,22 @@ public:
         const Status capacity_status =
             start_operation(required_event_count, required_match_market_data_count(preflight));
         if (capacity_status != Status::Accepted) {
-            MatchResult result{};
             result.status = capacity_status;
-            result.requested_quantity = quantity;
-            result.remaining_quantity = quantity;
             return finish_result(result);
         }
 
-        MatchResult result =
-            contra_side.match(quantity,
-                              false,
-                              0,
-                              order_ids_,
-                              orders_,
-                              event_log_,
-                              aggressor_id,
-                              aggressor_side,
-                              timestamp,
-                              participant_id,
-                              config_.self_trade_policy,
-                              active_market_data());
+        result = contra_side.match(quantity,
+                                   false,
+                                   0,
+                                   order_ids_,
+                                   orders_,
+                                   event_log_,
+                                   aggressor_id,
+                                   aggressor_side,
+                                   timestamp,
+                                   participant_id,
+                                   config_.self_trade_policy,
+                                   active_market_data());
         return finish_result(result);
     }
 
@@ -986,6 +1023,18 @@ public:
         return market_data_.current_sequence();
     }
 
+    /// Current resting-order FIFO sequence checkpoint.
+    [[nodiscard]] SequenceNumber fifo_sequence() const noexcept
+    {
+        return next_sequence_;
+    }
+
+    /// Current sequenced command-event checkpoint.
+    [[nodiscard]] SequenceNumber event_sequence() const noexcept
+    {
+        return event_log_.next_sequence_value();
+    }
+
     [[nodiscard]] std::uint32_t market_data_capacity() const noexcept
     {
         return market_data_.capacity();
@@ -1023,6 +1072,8 @@ public:
                     checksum_u64(hash, order->sequence);
                     checksum_u64(hash, order->participant_id);
                     checksum_u8(hash, order->post_only ? 1U : 0U);
+                    checksum_u64(hash, order->initial_quantity);
+                    checksum_u8(hash, static_cast<std::uint8_t>(order->state));
                     order = order->next;
                 }
             });
@@ -1345,6 +1396,42 @@ private:
             BookEvent::Kind::OrderRejected, reason, id, side, price, quantity, timestamp, time_in_force);
     }
 
+    void emit_preflight_order_rejected(const OrderId id,
+                                       const Side side,
+                                       const Price price,
+                                       const Quantity quantity,
+                                       const Timestamp timestamp,
+                                       const TimeInForce time_in_force,
+                                       const Status reason,
+                                       const Quantity old_quantity = 0,
+                                       const Quantity new_quantity = 0) noexcept
+    {
+        if (reason == Status::PriceLevelQuantityOverflow) {
+            event_log_.append_unsequenced_order(BookEvent::Kind::OrderRejected,
+                                                reason,
+                                                id,
+                                                side,
+                                                price,
+                                                quantity,
+                                                timestamp,
+                                                time_in_force,
+                                                old_quantity,
+                                                new_quantity);
+            return;
+        }
+
+        event_log_.append_order(BookEvent::Kind::OrderRejected,
+                                reason,
+                                id,
+                                side,
+                                price,
+                                quantity,
+                                timestamp,
+                                time_in_force,
+                                old_quantity,
+                                new_quantity);
+    }
+
     template <typename Result>
     [[nodiscard]] Result finish_result(Result result) noexcept
     {
@@ -1440,6 +1527,9 @@ private:
             orders_.release(order);
             return status;
         }
+
+        order->initial_quantity = record.initial_quantity;
+        order->state = record.state;
 
         return Status::Accepted;
     }

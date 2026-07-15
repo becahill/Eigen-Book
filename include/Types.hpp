@@ -99,13 +99,17 @@ enum class Status : std::uint8_t {
     JournalChecksumMismatch,
     JournalInvalidField,
     ReplayDiverged,
+    /// A resting residual would overflow the fixed-width aggregate quantity
+    /// stored by its target price level.
+    PriceLevelQuantityOverflow,
 
     // Compatibility aliases for older call sites.
     Ok = Accepted,
     OrderNotFound = UnknownOrderId,
 };
 
-inline constexpr std::size_t kStatusCount = static_cast<std::size_t>(Status::ReplayDiverged) + 1U;
+inline constexpr std::size_t kStatusCount =
+    static_cast<std::size_t>(Status::PriceLevelQuantityOverflow) + 1U;
 
 struct TradeEvent final {
     InstrumentId instrument_id{kInvalidInstrumentId};
@@ -232,7 +236,9 @@ struct OrderIdMapStats final {
     std::uint32_t size{0};
     std::uint32_t capacity{0};
     std::uint32_t tombstones{0};
+    /// Lookup probes; for erase, includes backward-shifted entries as work.
     std::uint32_t last_probe_count{0};
+    /// Histogram of the same probe/work count, saturated into the final bucket.
     std::array<std::uint64_t, kProbeHistogramBucketCount> probe_histogram{};
 };
 
@@ -319,6 +325,10 @@ struct BookSnapshotOrder final {
     SequenceNumber sequence{0};
     ParticipantId participant_id{kAnonymousParticipantId};
     bool post_only{false};
+    /// Quantity present when this order most recently joined the resting FIFO.
+    Quantity initial_quantity{0};
+    /// Persistent lifecycle state for a live resting order.
+    OrderState state{OrderState::Inactive};
 };
 
 struct BookSnapshotLevelAggregate final {
@@ -339,6 +349,8 @@ struct AddOrderResult final {
     std::uint32_t events_emitted{0};
     /// OrderBook-owned storage; valid until the next mutating call on that book.
     std::span<const BookEvent> events{};
+    bool aggressor_cancelled_by_stp{false};
+    std::uint32_t resting_orders_cancelled_by_stp{0};
 };
 
 struct CancelResult final {
@@ -372,12 +384,16 @@ struct ReplaceResult final {
     std::uint32_t events_emitted{0};
     /// OrderBook-owned storage; valid until the next mutating call on that book.
     std::span<const BookEvent> events{};
+    bool aggressor_cancelled_by_stp{false};
+    std::uint32_t resting_orders_cancelled_by_stp{0};
 };
 
 struct MatchResult final {
     Status status{Status::InternalError};
+    /// Always echoes the direct market request, including validation failures.
     Quantity requested_quantity{0};
     Quantity executed_quantity{0};
+    /// Unexecuted requested quantity, including the full request on rejection.
     Quantity remaining_quantity{0};
     std::uint32_t fills{0};
     bool has_last_price{false};

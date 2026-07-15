@@ -100,6 +100,39 @@ public:
         append(event);
     }
 
+    /// Append a synchronous diagnostic without consuming the sequenced event
+    /// stream. Sequence zero is reserved for these preflight-only events.
+    ///
+    /// This is used when reporting a rejection is part of the direct result
+    /// contract but the rejected operation must leave all engine sequence
+    /// state unchanged.
+    void append_unsequenced_order(const BookEvent::Kind kind,
+                                  const Status status,
+                                  const OrderId order_id,
+                                  const Side side,
+                                  const Price price,
+                                  const Quantity quantity,
+                                  const Timestamp timestamp,
+                                  const TimeInForce time_in_force = TimeInForce::Gtc,
+                                  const Quantity old_quantity = 0,
+                                  const Quantity new_quantity = 0) noexcept
+    {
+        BookEvent event{};
+        event.kind = kind;
+        event.instrument_id = instrument_id_;
+        event.status = status;
+        event.order_id = order_id;
+        event.side = side;
+        event.price = price;
+        event.quantity = quantity;
+        event.old_quantity = old_quantity;
+        event.new_quantity = new_quantity;
+        event.timestamp = timestamp;
+        event.sequence = 0;
+        event.time_in_force = time_in_force;
+        append(event);
+    }
+
     void append_trade(const OrderId aggressor_id,
                       const OrderId resting_id,
                       const Side aggressor_side,

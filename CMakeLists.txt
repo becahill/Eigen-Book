@@ -35,7 +35,9 @@ endif()
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
 endif()
-set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
+if(NOT CMAKE_CONFIGURATION_TYPES)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
+endif()
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -199,29 +201,87 @@ if(EIGENBOOK_BUILD_TESTS)
 endif()
 
 if(EIGENBOOK_BUILD_BENCHMARKS)
-    if(CMAKE_BUILD_TYPE STREQUAL "Release")
-        set(EIGENBOOK_BENCHMARK_OPTIMIZATION_FLAGS
-            "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_RELEASE}")
-        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang|GNU")
-            string(APPEND EIGENBOOK_BENCHMARK_OPTIMIZATION_FLAGS " -O3 -march=native")
-        endif()
-    else()
-        set(EIGENBOOK_BENCHMARK_OPTIMIZATION_FLAGS
-            "none configured for ${CMAKE_BUILD_TYPE}")
+    set(EIGENBOOK_BENCHMARK_DEBUG_FLAGS
+        "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_DEBUG}")
+    set(EIGENBOOK_BENCHMARK_RELEASE_FLAGS
+        "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_RELEASE}")
+    set(EIGENBOOK_BENCHMARK_RELWITHDEBINFO_FLAGS
+        "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
+    set(EIGENBOOK_BENCHMARK_MINSIZEREL_FLAGS
+        "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_MINSIZEREL}")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang|GNU")
+        string(APPEND EIGENBOOK_BENCHMARK_RELEASE_FLAGS " -O3 -march=native")
     endif()
-    string(STRIP "${EIGENBOOK_BENCHMARK_OPTIMIZATION_FLAGS}"
-        EIGENBOOK_BENCHMARK_OPTIMIZATION_FLAGS)
+    foreach(flag_variable IN ITEMS
+            EIGENBOOK_BENCHMARK_DEBUG_FLAGS
+            EIGENBOOK_BENCHMARK_RELEASE_FLAGS
+            EIGENBOOK_BENCHMARK_RELWITHDEBINFO_FLAGS
+            EIGENBOOK_BENCHMARK_MINSIZEREL_FLAGS)
+        string(STRIP "${${flag_variable}}" ${flag_variable})
+        if("${${flag_variable}}" STREQUAL "")
+            set(${flag_variable} "none configured")
+        endif()
+    endforeach()
+
+    set(EIGENBOOK_GIT_COMMIT "unavailable")
+    set(EIGENBOOK_GIT_WORKTREE "unavailable")
+    find_package(Git QUIET)
+    if(Git_FOUND)
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" -C "${CMAKE_CURRENT_SOURCE_DIR}"
+                rev-parse --verify HEAD
+            RESULT_VARIABLE EIGENBOOK_GIT_COMMIT_RESULT
+            OUTPUT_VARIABLE EIGENBOOK_GIT_COMMIT_OUTPUT
+            ERROR_QUIET
+            OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(EIGENBOOK_GIT_COMMIT_RESULT EQUAL 0 AND EIGENBOOK_GIT_COMMIT_OUTPUT)
+            set(EIGENBOOK_GIT_COMMIT "${EIGENBOOK_GIT_COMMIT_OUTPUT}")
+        endif()
+
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" -C "${CMAKE_CURRENT_SOURCE_DIR}"
+                status --porcelain=v1 --untracked-files=normal
+            RESULT_VARIABLE EIGENBOOK_GIT_STATUS_RESULT
+            OUTPUT_VARIABLE EIGENBOOK_GIT_STATUS_OUTPUT
+            ERROR_QUIET
+            OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(EIGENBOOK_GIT_STATUS_RESULT EQUAL 0)
+            if(EIGENBOOK_GIT_STATUS_OUTPUT)
+                set(EIGENBOOK_GIT_WORKTREE "dirty")
+            else()
+                set(EIGENBOOK_GIT_WORKTREE "clean")
+            endif()
+        endif()
+    endif()
 
     configure_file(
         benchmarks/BenchmarkBuildInfo.hpp.in
-        generated/BenchmarkBuildInfo.hpp
+        generated/BenchmarkBuildInfo.hpp.in
         @ONLY)
+    file(GENERATE
+        OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/$<CONFIG>/BenchmarkBuildInfo.hpp"
+        INPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/BenchmarkBuildInfo.hpp.in")
 
     add_executable(eigenbook_bench
         benchmarks/bench.cpp)
     target_link_libraries(eigenbook_bench PRIVATE EigenBook::eigenbook)
     target_include_directories(eigenbook_bench PRIVATE
-        "${CMAKE_CURRENT_BINARY_DIR}/generated")
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/$<CONFIG>")
+
+    if(EIGENBOOK_BUILD_TESTS AND BUILD_TESTING)
+        foreach(format IN ITEMS text json)
+            add_test(
+                NAME eigenbook_benchmark_${format}_smoke
+                COMMAND "${CMAKE_COMMAND}"
+                    "-DEIGENBOOK_BENCHMARK_EXECUTABLE=$<TARGET_FILE:eigenbook_bench>"
+                    "-DEIGENBOOK_BENCHMARK_EXPECTED_CONFIG=$<CONFIG>"
+                    "-DEIGENBOOK_BENCHMARK_FORMAT=${format}"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/verify_benchmark_output.cmake")
+            set_tests_properties(
+                eigenbook_benchmark_${format}_smoke
+                PROPERTIES LABELS benchmark)
+        endforeach()
+    endif()
 
     add_custom_target(run_benchmarks
         COMMAND $<TARGET_FILE:eigenbook_bench>
@@ -283,6 +343,7 @@ if(EIGENBOOK_BUILD_FUZZERS)
     eigenbook_add_fuzzer(eigenbook_command_fuzzer fuzz/fuzz_command_decode.cpp)
     eigenbook_add_fuzzer(eigenbook_snapshot_fuzzer fuzz/fuzz_snapshot_restore.cpp)
     eigenbook_add_fuzzer(eigenbook_stateful_fuzzer fuzz/fuzz_stateful_differential.cpp)
+    eigenbook_add_fuzzer(eigenbook_journal_fuzzer fuzz/fuzz_journal_replay.cpp)
 
     add_executable(eigenbook_generate_fuzz_corpus
         fuzz/generate_corpus.cpp)
@@ -292,6 +353,7 @@ if(EIGENBOOK_BUILD_FUZZERS)
     set(EIGENBOOK_COMMAND_CORPUS_DIR "${EIGENBOOK_FUZZ_CORPUS_DIR}/command")
     set(EIGENBOOK_SNAPSHOT_CORPUS_DIR "${EIGENBOOK_FUZZ_CORPUS_DIR}/snapshot")
     set(EIGENBOOK_STATEFUL_CORPUS_DIR "${EIGENBOOK_FUZZ_CORPUS_DIR}/stateful")
+    set(EIGENBOOK_JOURNAL_CORPUS_DIR "${EIGENBOOK_FUZZ_CORPUS_DIR}/journal")
     set(EIGENBOOK_FUZZ_ARTIFACT_DIR "${CMAKE_CURRENT_BINARY_DIR}/fuzz-artifacts")
     set(EIGENBOOK_FUZZ_CORPUS_FILES
         "${EIGENBOOK_COMMAND_CORPUS_DIR}/add"
@@ -301,7 +363,20 @@ if(EIGENBOOK_BUILD_FUZZERS)
         "${EIGENBOOK_STATEFUL_CORPUS_DIR}/command-classes"
         "${EIGENBOOK_STATEFUL_CORPUS_DIR}/capacity-and-invalid"
         "${EIGENBOOK_STATEFUL_CORPUS_DIR}/snapshot-replay"
-        "${EIGENBOOK_STATEFUL_CORPUS_DIR}/quantity-overflow")
+        "${EIGENBOOK_STATEFUL_CORPUS_DIR}/quantity-overflow"
+        "${EIGENBOOK_STATEFUL_CORPUS_DIR}/venue-features"
+        "${EIGENBOOK_JOURNAL_CORPUS_DIR}/valid-single"
+        "${EIGENBOOK_JOURNAL_CORPUS_DIR}/valid-sequence"
+        "${EIGENBOOK_JOURNAL_CORPUS_DIR}/truncated-header"
+        "${EIGENBOOK_JOURNAL_CORPUS_DIR}/bad-magic"
+        "${EIGENBOOK_JOURNAL_CORPUS_DIR}/bad-version"
+        "${EIGENBOOK_JOURNAL_CORPUS_DIR}/bad-length"
+        "${EIGENBOOK_JOURNAL_CORPUS_DIR}/bad-checksum"
+        "${EIGENBOOK_JOURNAL_CORPUS_DIR}/reserved-field"
+        "${EIGENBOOK_JOURNAL_CORPUS_DIR}/invalid-flags"
+        "${EIGENBOOK_JOURNAL_CORPUS_DIR}/invalid-op"
+        "${EIGENBOOK_JOURNAL_CORPUS_DIR}/zero-sequence"
+        "${EIGENBOOK_JOURNAL_CORPUS_DIR}/replay-divergence")
 
     add_custom_command(
         OUTPUT ${EIGENBOOK_FUZZ_CORPUS_FILES}
@@ -309,6 +384,7 @@ if(EIGENBOOK_BUILD_FUZZERS)
             "${EIGENBOOK_COMMAND_CORPUS_DIR}"
             "${EIGENBOOK_SNAPSHOT_CORPUS_DIR}"
             "${EIGENBOOK_STATEFUL_CORPUS_DIR}"
+            "${EIGENBOOK_JOURNAL_CORPUS_DIR}"
             "${EIGENBOOK_FUZZ_ARTIFACT_DIR}"
         COMMAND $<TARGET_FILE:eigenbook_generate_fuzz_corpus> "${EIGENBOOK_FUZZ_CORPUS_DIR}"
         DEPENDS eigenbook_generate_fuzz_corpus
@@ -318,6 +394,7 @@ if(EIGENBOOK_BUILD_FUZZERS)
     add_dependencies(eigenbook_command_fuzzer eigenbook_fuzz_corpus)
     add_dependencies(eigenbook_snapshot_fuzzer eigenbook_fuzz_corpus)
     add_dependencies(eigenbook_stateful_fuzzer eigenbook_fuzz_corpus)
+    add_dependencies(eigenbook_journal_fuzzer eigenbook_fuzz_corpus)
 
     if(BUILD_TESTING)
         file(MAKE_DIRECTORY "${EIGENBOOK_FUZZ_ARTIFACT_DIR}")
@@ -342,10 +419,18 @@ if(EIGENBOOK_BUILD_FUZZERS)
                 -max_len=4096
                 "-artifact_prefix=${EIGENBOOK_FUZZ_ARTIFACT_DIR}/"
                 "${EIGENBOOK_STATEFUL_CORPUS_DIR}")
+        add_test(NAME eigenbook_fuzz_journal_smoke
+            COMMAND eigenbook_journal_fuzzer
+                -runs=256
+                -seed=1
+                -max_len=4096
+                "-artifact_prefix=${EIGENBOOK_FUZZ_ARTIFACT_DIR}/"
+                "${EIGENBOOK_JOURNAL_CORPUS_DIR}")
         set_tests_properties(
             eigenbook_fuzz_command_smoke
             eigenbook_fuzz_snapshot_smoke
             eigenbook_fuzz_stateful_smoke
+            eigenbook_fuzz_journal_smoke
             PROPERTIES TIMEOUT 60 LABELS fuzz)
     endif()
 endif()
