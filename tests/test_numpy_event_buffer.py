@@ -169,24 +169,30 @@ def test_full_event_buffer() -> None:
         max_orders=3,
         event_log_capacity=4,
     )
-    assert engine.dispatch_with_buffer(
-        make_add_command(
-            order_id=1,
-            side=eb.Side.SELL,
-            price=99,
-            quantity=1,
-        ),
-        event_buffer,
-    ) == 2
-    assert engine.dispatch_with_buffer(
-        make_add_command(
-            order_id=2,
-            side=eb.Side.SELL,
-            price=100,
-            quantity=1,
-        ),
-        event_buffer,
-    ) == 2
+    assert (
+        engine.dispatch_with_buffer(
+            make_add_command(
+                order_id=1,
+                side=eb.Side.SELL,
+                price=99,
+                quantity=1,
+            ),
+            event_buffer,
+        )
+        == 2
+    )
+    assert (
+        engine.dispatch_with_buffer(
+            make_add_command(
+                order_id=2,
+                side=eb.Side.SELL,
+                price=100,
+                quantity=1,
+            ),
+            event_buffer,
+        )
+        == 2
+    )
 
     result = engine.dispatch_result_with_buffer(
         make_add_command(
@@ -212,15 +218,18 @@ def test_full_event_buffer() -> None:
 def test_depth_writes_float32_c_contiguous_buffer() -> None:
     engine, event_buffer = make_engine_and_buffer()
     for order_id, price, quantity in ((1, 98, 2), (2, 99, 3), (3, 99, 4)):
-        assert engine.dispatch_with_buffer(
-            make_add_command(
-                order_id=order_id,
-                side=eb.Side.BUY,
-                price=price,
-                quantity=quantity,
-            ),
-            event_buffer,
-        ) == 2
+        assert (
+            engine.dispatch_with_buffer(
+                make_add_command(
+                    order_id=order_id,
+                    side=eb.Side.BUY,
+                    price=price,
+                    quantity=quantity,
+                ),
+                event_buffer,
+            )
+            == 2
+        )
 
     depth_buffer = np.full((5, 2), -1.0, dtype=np.float32)
     depth_address = depth_buffer.ctypes.data

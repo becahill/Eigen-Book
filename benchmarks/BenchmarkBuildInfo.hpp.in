@@ -2,13 +2,18 @@
 
 namespace eigenbook::benchmark_build {
 
-inline constexpr char kBuildType[] = R"eigenbook(@CMAKE_BUILD_TYPE@)eigenbook";
+inline constexpr char kBuildType[] = R"eigenbook($<CONFIG>)eigenbook";
 inline constexpr char kCompilerId[] = R"eigenbook(@CMAKE_CXX_COMPILER_ID@)eigenbook";
 inline constexpr char kCompilerVersion[] = R"eigenbook(@CMAKE_CXX_COMPILER_VERSION@)eigenbook";
 inline constexpr char kCompilerPath[] = R"eigenbook(@CMAKE_CXX_COMPILER@)eigenbook";
 inline constexpr char kOptimizationFlags[] =
-    R"eigenbook(@EIGENBOOK_BENCHMARK_OPTIMIZATION_FLAGS@)eigenbook";
+    R"eigenbook($<$<CONFIG:Debug>:@EIGENBOOK_BENCHMARK_DEBUG_FLAGS@>)eigenbook"
+    R"eigenbook($<$<CONFIG:Release>:@EIGENBOOK_BENCHMARK_RELEASE_FLAGS@>)eigenbook"
+    R"eigenbook($<$<CONFIG:RelWithDebInfo>:@EIGENBOOK_BENCHMARK_RELWITHDEBINFO_FLAGS@>)eigenbook"
+    R"eigenbook($<$<CONFIG:MinSizeRel>:@EIGENBOOK_BENCHMARK_MINSIZEREL_FLAGS@>)eigenbook";
 inline constexpr char kCMakeVersion[] = R"eigenbook(@CMAKE_VERSION@)eigenbook";
 inline constexpr char kCMakeGenerator[] = R"eigenbook(@CMAKE_GENERATOR@)eigenbook";
+inline constexpr char kGitCommit[] = R"eigenbook(@EIGENBOOK_GIT_COMMIT@)eigenbook";
+inline constexpr char kGitWorktree[] = R"eigenbook(@EIGENBOOK_GIT_WORKTREE@)eigenbook";
 
 } // namespace eigenbook::benchmark_build

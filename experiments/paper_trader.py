@@ -1,106 +1,217 @@
-import asyncio
-import json
-import websockets
-import numpy as np
-import gymnasium as gym
-import eigenbook
-from eigenbook.env import LimitOrderBookEnv
+#!/usr/bin/env python3
+"""Run a saved policy as a deterministic, no-order-transmission paper replay.
+
+This command consumes the same canonical sequenced depth-and-trade tape, fill
+model, causal feature extractor, observation schema, action schema, and model
+sidecar used during training.  It deliberately does not substitute one venue's
+live trades for another venue's training book.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
 from stable_baselines3 import PPO
 
-class OrderBookFeaturesWrapper(gym.Wrapper):
-    def __init__(self, env):
-        super().__init__(env)
-        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32)
-        
-    def observation(self, obs):
-        best_bid_p = obs[0][0][0]
-        best_ask_p = obs[1][0][0]
-        spread = 0.0 if best_bid_p == 0 else (best_ask_p - best_bid_p)
-        top_volume = obs[0][0][1] + obs[1][0][1]
-        return np.array([best_bid_p / 100000.0, best_ask_p / 100000.0, spread / 100.0, top_volume / 100.0], dtype=np.float32)
-        
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        return self.observation(obs), reward, terminated, truncated, info
-        
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        return self.observation(obs), info
+from eigenbook.model_artifact import (
+    ModelCompatibilityError,
+    load_model_artifact,
+    read_model_metadata,
+)
+from eigenbook.replay import ReplayConfig
 
-async def run_paper_trader():
-    book = eigenbook.BookConfig()
-    book.min_price = 4000000
-    book.max_price = 4500000
-    book.max_orders = 10000
-    book.order_id_map_capacity = 20000
-    
-    instrument = eigenbook.InstrumentConfig()
-    instrument.instrument_id = 1
-    instrument.book_config = book
-    
-    env = LimitOrderBookEnv(instrument, max_episode_steps=100000, max_abs_inventory=100)
-    env = OrderBookFeaturesWrapper(env)
-    
-    model = PPO.load("ppo_eigenbook_agent.zip")
-    obs, info = env.reset()
-    
-    TARGET_PRICE = 42500.00 
-    price_offset = None
-    
-    _eb = getattr(eigenbook, "_eigenbook", eigenbook)
-    SIDE_SELL = getattr(_eb.Side, "SELL", getattr(_eb.Side, "Sell", None))
-    SIDE_BUY = getattr(_eb.Side, "BUY", getattr(_eb.Side, "Buy", None))
-    TIF_IOC = getattr(_eb.TimeInForce, "IOC", getattr(_eb.TimeInForce, "Ioc", None))
-    OP_ADD = getattr(_eb.CommandOp, "ADD_LIMIT", getattr(_eb.CommandOp, "AddLimit", None))
-    
-    uri = "wss://ws-feed.exchange.coinbase.com"
-    async with websockets.connect(uri) as websocket:
-        await websocket.send(json.dumps({"type": "subscribe", "product_ids": ["BTC-USD"], "channels": ["matches"]}))
-        
-        async for message in websocket:
-            data = json.loads(message)
-            if data.get("type") == "match":
-                live_price = float(data["price"])
-                size = float(data["size"])
-                taker_side = "SELL" if data["side"] == "buy" else "BUY"
-                
-                if price_offset is None:
-                    price_offset = live_price - TARGET_PRICE
-                    print(f"\n[MLOps] Neural Network trained at ~${TARGET_PRICE:,.2f}. Live market is ~${live_price:,.2f}.")
-                    print(f"[MLOps] Calibrating live flow: Shifting inputs by -${price_offset:,.2f}\n")
-                
-                shifted_price = live_price - price_offset
-                price_int = int(shifted_price * 100)
-                qty_int = max(1, int(size * 100000))
-                side_enum = SIDE_SELL if taker_side == "SELL" else SIDE_BUY
-                
-                try:
-                    env.unwrapped.engine.dispatch(
-                        _eb.Command(
-                            instrument_id=1, 
-                            op=OP_ADD, 
-                            order_id=999999, 
-                            side=side_enum, 
-                            price=price_int, 
-                            quantity=qty_int, 
-                            time_in_force=TIF_IOC
-                        )
-                    )
-                except Exception as e:
-                    pass 
-                
-                action, _ = model.predict(obs, deterministic=True)
-                obs, reward, terminated, truncated, info = env.step(action)
-                
-                inventory = info.get("inventory", 0)
-                print(f"LIVE TAPE | {taker_side:4} {size:8.5f} BTC @ ${live_price:8.2f} (Agent Sees: ${shifted_price:8.2f}) | PnL: {reward:8.2f} | Inv: {inventory:+}")
-                
-                if terminated or truncated:
-                    print("Limit reached. Resetting...")
-                    obs, info = env.reset()
+if __package__:
+    from . import train_market_data as training
+else:
+    import train_market_data as training
+
+
+@dataclass(frozen=True, slots=True)
+class PaperConfig:
+    market_data_path: Path
+    model_path: Path
+    maximum_steps: int
+    seed: int
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _seed(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0 or parsed > (1 << 32) - 1:
+        raise argparse.ArgumentTypeError("must fit an unsigned 32-bit seed")
+    return parsed
+
+
+def parse_args(arguments: Sequence[str] | None = None) -> PaperConfig:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Evaluate a compatible policy on a validated, bounded paper tape; "
+            "no orders are transmitted."
+        )
+    )
+    parser.add_argument("--market-data", type=Path, required=True)
+    parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--maximum-steps", type=_positive_int, default=10_000)
+    parser.add_argument("--seed", type=_seed, default=7)
+    args = parser.parse_args(arguments)
+    return PaperConfig(args.market_data, args.model, args.maximum_steps, args.seed)
+
+
+def _required_feature(
+    configuration: Mapping[str, Any],
+    name: str,
+) -> Any:
+    if name not in configuration:
+        raise ModelCompatibilityError(
+            f"model feature configuration is missing {name!r}"
+        )
+    return configuration[name]
+
+
+def replay_config_from_model(model_path: Path, *, maximum_steps: int) -> ReplayConfig:
+    """Reconstruct the exact simulator semantics stored with a model."""
+
+    metadata = read_model_metadata(model_path)
+    feature = metadata.feature_configuration
+    return ReplayConfig(
+        symbol=metadata.symbol,
+        venue=metadata.venue,
+        data_mode=metadata.market_data_mode,
+        price_scale=metadata.price_scale,
+        quantity_scale=metadata.quantity_scale,
+        own_order_min_price=int(_required_feature(feature, "own_order_min_price")),
+        own_order_max_price=int(_required_feature(feature, "own_order_max_price")),
+        tick_size=int(_required_feature(feature, "tick_size")),
+        lot_size=int(_required_feature(feature, "lot_size")),
+        max_quote_distance_ticks=int(
+            _required_feature(feature, "max_quote_distance_ticks")
+        ),
+        max_order_quantity_lots=int(
+            _required_feature(feature, "max_order_quantity_lots")
+        ),
+        max_abs_inventory_lots=(
+            None
+            if _required_feature(feature, "max_abs_inventory_lots") is None
+            else int(feature["max_abs_inventory_lots"])
+        ),
+        max_episode_steps=maximum_steps,
+        events_per_action=int(_required_feature(feature, "events_per_action")),
+        order_entry_latency_events=int(
+            _required_feature(feature, "order_entry_latency_events")
+        ),
+        maker_fee_rate=metadata.maker_fee_rate,
+        taker_fee_rate=metadata.taker_fee_rate,
+        feature_window_size=int(_required_feature(feature, "window_size")),
+        feature_spread_scale_ticks=int(
+            _required_feature(feature, "spread_scale_ticks")
+        ),
+        inventory_penalty_rate=float(
+            _required_feature(feature, "inventory_penalty_rate")
+        ),
+        liquidate_on_termination=bool(
+            _required_feature(feature, "liquidate_on_termination")
+        ),
+    )
+
+
+def _pre_inference_checks(env: Any) -> None:
+    base = env.unwrapped
+    if not base.feed_synchronized:
+        raise RuntimeError("feed is unsynchronized; inference is prohibited")
+    limit = base.config.max_abs_inventory
+    if limit is not None and abs(base.inventory) >= limit:
+        raise RuntimeError("inventory risk limit reached before inference")
+    for name, price in (
+        ("best_bid", base.market.best_bid),
+        ("best_ask", base.market.best_ask),
+    ):
+        if price is not None and not (
+            base.config.own_order_min_price <= price <= base.config.own_order_max_price
+        ):
+            raise RuntimeError(
+                f"{name}={price} is outside the configured own-order range"
+            )
+
+
+def run_paper_replay(config: PaperConfig) -> dict[str, Any]:
+    """Run compatible inference until the bounded tape or risk episode ends."""
+
+    replay_config = replay_config_from_model(
+        config.model_path,
+        maximum_steps=config.maximum_steps,
+    )
+    training.validate_market_data_contract(
+        config.market_data_path,
+        config=replay_config,
+    )
+    env = training.create_environment(
+        config.market_data_path,
+        config=replay_config,
+    )
+    try:
+        expected = training.model_metadata(env, replay_config)
+        model = load_model_artifact(
+            PPO,
+            config.model_path,
+            env=env,
+            expected_metadata=expected,
+            device="cpu",
+        )
+        observation, reset_info = env.reset(seed=config.seed)
+        if not reset_info["feed_synchronized"]:
+            raise RuntimeError("initial snapshot did not synchronize the feed")
+
+        total_reward = 0.0
+        final_info: dict[str, Any] = dict(reset_info)
+        terminated = truncated = False
+        completed = 0
+        for completed in range(1, config.maximum_steps + 1):
+            _pre_inference_checks(env)
+            action, _ = model.predict(observation, deterministic=True)
+            if not env.action_space.contains(action):
+                raise RuntimeError("model produced an action outside its saved space")
+            observation, reward, terminated, truncated, final_info = env.step(action)
+            total_reward += float(reward)
+            if not final_info["feed_synchronized"]:
+                raise RuntimeError("feed lost synchronization during paper replay")
+            if terminated or truncated:
+                break
+        return {
+            "steps": completed,
+            "total_reward": total_reward,
+            "terminated": terminated,
+            "truncated": truncated,
+            "final_info": final_info,
+            "symbol": replay_config.symbol,
+            "venue": replay_config.venue,
+        }
+    finally:
+        env.close()
+
+
+def main(arguments: Sequence[str] | None = None) -> int:
+    result = run_paper_replay(parse_args(arguments))
+    info = result["final_info"]
+    print(
+        f"[paper] venue={result['venue']} symbol={result['symbol']} "
+        f"steps={result['steps']} reward={result['total_reward']:.6f} "
+        f"inventory={info.get('inventory', 0)} "
+        f"wealth={info.get('wealth', 0.0):.6f} "
+        f"termination={info.get('termination_reason')}",
+        flush=True,
+    )
+    return 0
+
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(run_paper_trader())
-    except KeyboardInterrupt:
-        print("\nDisconnected from live stream.")
+    raise SystemExit(main())

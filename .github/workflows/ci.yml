@@ -8,6 +8,28 @@ permissions:
   contents: read
 
 jobs:
+  python-quality:
+    name: Python lint and format
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Install pinned Python quality tools
+        run: python -m pip install ruff==0.15.13
+
+      - name: Lint Python sources
+        run: ruff check .
+
+      - name: Check Python formatting
+        run: ruff format --check .
+
   build:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
@@ -46,6 +68,12 @@ jobs:
       - name: Build tests, examples, and benchmarks
         run: cmake --build "${{ matrix.build-dir }}" --parallel
 
+      - name: Run benchmark text and JSON smoke tests
+        if: matrix.build-type == 'Release'
+        run: >
+          ctest --test-dir "${{ matrix.build-dir }}" --output-on-failure
+          --label-regex '^benchmark$'
+
       - name: Run zero-allocation hot-path guard
         if: matrix.build-type == 'Debug' || matrix.build-type == 'Release'
         run: >
@@ -60,8 +88,67 @@ jobs:
       - name: Run tests
         run: ctest --test-dir "${{ matrix.build-dir }}" --output-on-failure
 
+  multi-config:
+    name: Ninja multi-config Debug and Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install Ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ninja-build
+
+      - name: Configure Ninja multi-config build
+        run: >
+          cmake -S . -B build-ci-multi -G "Ninja Multi-Config"
+          -DCMAKE_CONFIGURATION_TYPES="Debug;Release"
+
+      - name: Build and test Debug configuration
+        run: |
+          cmake --build build-ci-multi --config Debug --parallel
+          ctest --test-dir build-ci-multi --build-config Debug --output-on-failure
+
+      - name: Build and test Release configuration
+        run: |
+          cmake --build build-ci-multi --config Release --parallel
+          ctest --test-dir build-ci-multi --build-config Release --output-on-failure
+
+  macos-native:
+    name: macOS native and package smoke
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Configure Release build
+        run: cmake -S . -B build-ci-macos -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build with strict warnings
+        run: cmake --build build-ci-macos --parallel
+
+      - name: Run native, allocation, package, and benchmark tests
+        run: ctest --test-dir build-ci-macos --output-on-failure
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Install macOS Python package
+        run: python -m pip install .
+
+      - name: Import macOS package outside the source tree
+        working-directory: ${{ runner.temp }}
+        run: >
+          python -I -c
+          "import eigenbook; print(eigenbook.__version__, eigenbook.NATIVE_COMPILER)"
+
   python-core:
-    name: Python ${{ matrix.python-version }} core package
+    name: Python ${{ matrix.python-version }} core install
     runs-on: ubuntu-latest
 
     strategy:
@@ -78,82 +165,99 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install core package and test runner
+      - name: Install core package and test tools
         run: python -m pip install '.[test]'
 
-      - name: Verify Gymnasium is not a core dependency
-        run: >
-          python -c "import importlib.util;
-          assert importlib.util.find_spec('gymnasium') is None"
+      - name: Verify isolated core import and optional-dependency boundary
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -I - <<'PY'
+          import importlib.metadata
+          import importlib.util
 
-      - name: Test installed core package
+          assert importlib.util.find_spec("gymnasium") is None
+          import eigenbook
+
+          assert importlib.metadata.version("eigenbook") == eigenbook.__version__
+          assert importlib.util.find_spec("eigenbook._eigenbook") is not None
+          try:
+              from eigenbook import LimitOrderBookEnv  # noqa: F401
+          except ModuleNotFoundError as error:
+              assert "eigenbook[rl]" in str(error)
+          else:
+              raise AssertionError("core install unexpectedly exposes the RL environment")
+          PY
+
+      - name: Run core package suite
         working-directory: ${{ runner.temp }}
         run: >
           python -m pytest
-          "${{ github.workspace }}/tests/test_python_bindings.py"
-          "${{ github.workspace }}/tests/test_numpy_event_buffer.py"
-          "${{ github.workspace }}/tests/test_packaging.py"
-
-  python-rl:
-    name: Python Gymnasium extra
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v7
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Install package with RL and test extras
-        run: python -m pip install '.[rl,test]'
-
-      - name: Test installed Gymnasium environment
-        working-directory: ${{ runner.temp }}
-        run: >
-          python -m pytest
-          "${{ github.workspace }}/tests/test_eigenbook_env.py"
-
-  python-training:
-    name: Python 3.12 PPO training smoke
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v7
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Install package with training and test extras
-        run: python -m pip install '.[training,test]'
-
-      - name: Test PPO training utilities
-        working-directory: ${{ runner.temp }}
-        run: >
-          python -m pytest
-          --basetemp "${{ runner.temp }}/eigenbook-ppo-pytest"
-          "${{ github.workspace }}/tests/test_train_ppo.py"
+          -c "${{ github.workspace }}/pyproject.toml"
+          --basetemp "${{ runner.temp }}/eigenbook-core-pytest"
+          -m "not rl and not training"
+          "${{ github.workspace }}/tests"
         env:
           PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONPATH: "${{ github.workspace }}"
+
+  python-all-extras:
+    name: Python 3.12 all extras and full test suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Verify repository-owned CI inputs are tracked
+        run: >
+          git ls-files --error-unmatch
+          benchmarks/bench_python_env.py
+          scripts/train_ppo.py
+          tests/fixtures/market_data/valid_atomic.csv
+
+      - name: Install package with every optional extra
+        run: python -m pip install '.[rl,training,benchmark,test]'
+
+      - name: Discover and run the complete Python suite
+        working-directory: ${{ runner.temp }}
+        run: >
+          python -m pytest
+          -c "${{ github.workspace }}/pyproject.toml"
+          --basetemp "${{ runner.temp }}/eigenbook-all-extras-pytest"
+          "${{ github.workspace }}/tests"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONPATH: "${{ github.workspace }}"
 
       - name: Run train-save-load-evaluate smoke cycle
         working-directory: ${{ runner.temp }}
         run: >
           python "${{ github.workspace }}/scripts/train_ppo.py"
+          --market-data "${{ github.workspace }}/tests/fixtures/market_data/valid_atomic.csv"
+          --evaluation-market-data "${{ github.workspace }}/tests/fixtures/market_data/valid_atomic.csv"
+          --symbol BTCUSDT
+          --venue binance_spot
+          --data-mode depth_trades
+          --price-scale 100
+          --quantity-scale 1000
           --training-timesteps 8
           --evaluation-steps 4
           --seed 7
-          --ppo-rollout-steps 8
-          --ppo-batch-size 4
-          --model-output "${{ runner.temp }}/eigenbook-ppo-smoke/agent"
-          --quiet
+          --model-path "${{ runner.temp }}/eigenbook-ppo-smoke/agent"
         env:
           PYTHONDONTWRITEBYTECODE: "1"
+
+      - name: Run Python/native boundary benchmark smoke
+        working-directory: ${{ runner.temp }}
+        run: >
+          python "${{ github.workspace }}/benchmarks/bench_python_env.py"
+          --iterations 20
+          --warmup 5
 
   python-wheel:
     name: Build and install wheel
@@ -177,16 +281,25 @@ jobs:
         run: |
           python -m venv "${RUNNER_TEMP}/wheel-venv"
           wheel=$(find wheelhouse -name '*.whl' -print -quit)
-          "${RUNNER_TEMP}/wheel-venv/bin/python" -m pip install "${wheel}[test]"
+          "${RUNNER_TEMP}/wheel-venv/bin/python" -m pip install \
+            "${wheel}[rl,training,benchmark,test]"
 
-      - name: Test wheel outside the source tree
+      - name: Import wheel outside the source tree
         working-directory: ${{ runner.temp }}
-        run: |
-          "${RUNNER_TEMP}/wheel-venv/bin/python" -I -c "import eigenbook; print(eigenbook.__version__)"
-          "${RUNNER_TEMP}/wheel-venv/bin/python" -m pytest \
-            "${GITHUB_WORKSPACE}/tests/test_python_bindings.py" \
-            "${GITHUB_WORKSPACE}/tests/test_numpy_event_buffer.py" \
-            "${GITHUB_WORKSPACE}/tests/test_packaging.py"
+        run: >
+          "${RUNNER_TEMP}/wheel-venv/bin/python" -I -c
+          "import eigenbook; print(eigenbook.__version__)"
+
+      - name: Run complete suite against the installed wheel
+        working-directory: ${{ runner.temp }}
+        run: >
+          "${RUNNER_TEMP}/wheel-venv/bin/python" -m pytest
+          -c "${GITHUB_WORKSPACE}/pyproject.toml"
+          --basetemp "${RUNNER_TEMP}/eigenbook-wheel-pytest"
+          "${GITHUB_WORKSPACE}/tests"
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONPATH: "${{ github.workspace }}"
 
   fuzz-smoke:
     name: Clang fuzz smoke
@@ -213,10 +326,7 @@ jobs:
           -DEIGENBOOK_BUILD_EXAMPLES=OFF
 
       - name: Build fuzzers
-        run: >
-          cmake --build build-ci-fuzz --parallel
-          --target eigenbook_command_fuzzer eigenbook_snapshot_fuzzer
-          eigenbook_stateful_fuzzer
+        run: cmake --build build-ci-fuzz --parallel
 
       - name: Run bounded fuzz smoke tests
         run: >

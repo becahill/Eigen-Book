@@ -15,6 +15,11 @@ __pycache__/
 .venv/
 venv/
 env/
+.cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
 
 # Python packaging output and metadata
 dist/
@@ -29,13 +34,46 @@ htmlcov/
 
 # Local market-data downloads
 data/
+datasets/
+downloads/
+captures/
+recordings/
 market-data/
 market_data/
-*-aggTrades-*.csv
-*-aggTrades-*.zip
-*-trades-*.csv
-*-trades-*.zip
+!tests/fixtures/market_data/
+!tests/fixtures/market_data/*.csv
+*-aggTrades-*
+*-trades-*
+*-level2-*
+*-bookTicker-*
+*-depth-*.csv
+*-depth-*.csv.gz
+*-depth-*.zip
+*-klines-*
 *.parquet
+*.feather
+*.arrow
+*.h5
+*.hdf5
+*.jsonl
+*.ndjson
+
+# Downloaded archives and interrupted/atomic temporary outputs
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.tar.bz2
+*.tar.xz
+*.csv.gz
+*.csv.bz2
+*.csv.xz
+*.tmp
+*.temp
+*.part
+*.partial
+*.download
+*.crdownload
 
 # TensorBoard and experiment logs
 tb_logs/
@@ -46,13 +84,42 @@ runs/
 training-output/
 experiment-output/
 experiments/output/
+artifacts/
+outputs/
+results/
 models/
 checkpoints/
 ppo_*.zip
+*.metadata.json
+*.ckpt
 *.pt
 *.pth
 *.onnx
+*.safetensors
+*.joblib
+*.pkl
+*.pickle
 wandb/
 mlruns/
+
+# Local credentials and personal assistant configuration
+.env
+.env.*
+!.env.example
+!.env.template
+.envrc
+.direnv/
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
+.cursor/
+.cursorrules
+.claude/
+.codex/
+AGENTS.local.md
+CLAUDE.local.md
 
 .DS_Store

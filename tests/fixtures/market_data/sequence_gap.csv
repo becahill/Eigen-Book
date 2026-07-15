@@ -1,0 +1,4 @@
+schema_version,data_mode,venue,symbol,price_scale,quantity_scale,event_id,event_time,event_kind,first_update_id,last_update_id,previous_update_id,trade_id,first_trade_id,last_trade_id,aggressor_side,side,price,size
+eigenbook.market_data.v2,depth,binance_spot,BTCUSDT,100,1000,1,1700000000000,snapshot,100,100,,,,,,bid,100.00,5.000
+eigenbook.market_data.v2,depth,binance_spot,BTCUSDT,100,1000,1,1700000000000,snapshot,100,100,,,,,,ask,101.00,4.000
+eigenbook.market_data.v2,depth,binance_spot,BTCUSDT,100,1000,2,1700000000001,depth_update,102,102,100,,,,,bid,100.00,6.000

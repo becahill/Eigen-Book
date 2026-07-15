@@ -10,11 +10,15 @@ struct alignas(64) Order final {
     OrderId id{kInvalidOrderId};
     Price price{0};
     Quantity quantity{0};
+    /// Quantity with which this order most recently joined its resting FIFO.
+    /// Persistent across fills/reductions and snapshot round trips.
     Quantity initial_quantity{0};
     Timestamp timestamp{0};
     SequenceNumber sequence{0};
     ParticipantId participant_id{kAnonymousParticipantId};
     Side side{Side::Buy};
+    /// Persistent lifecycle state for a live order. Snapshot restore preserves
+    /// `Resting` and `PartiallyFilled` exactly.
     OrderState state{OrderState::Inactive};
     Order* prev{nullptr};
     Order* next{nullptr};

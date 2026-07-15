@@ -114,6 +114,9 @@ public:
 
         const std::uint32_t index = index_for_price(order.price);
         PriceLevel& level = levels_[index];
+        if (std::numeric_limits<Quantity>::max() - level.total_quantity() < order.quantity) {
+            return Status::PriceLevelQuantityOverflow;
+        }
         const bool was_empty = level.empty();
         if (!level.append(order)) {
             return Status::InternalError;
@@ -124,6 +127,22 @@ public:
         }
 
         return Status::Accepted;
+    }
+
+    [[nodiscard]] Status can_accept_residual(const Price price,
+                                             const Quantity residual_quantity) const noexcept
+    {
+        if (residual_quantity == 0) {
+            return Status::Accepted;
+        }
+        if (!price_in_range(price)) {
+            return Status::InternalError;
+        }
+
+        const Quantity target_quantity = levels_[index_for_price(price)].total_quantity();
+        return std::numeric_limits<Quantity>::max() - target_quantity < residual_quantity
+                   ? Status::PriceLevelQuantityOverflow
+                   : Status::Accepted;
     }
 
     [[nodiscard]] Status can_accept_replacement_residual(const Order& old_order,
@@ -150,7 +169,7 @@ public:
         }
 
         return std::numeric_limits<Quantity>::max() - target_quantity < residual_quantity
-                   ? Status::InternalError
+                   ? Status::PriceLevelQuantityOverflow
                    : Status::Accepted;
     }
 
@@ -899,6 +918,12 @@ public:
         }
 
         PriceLevel& level = levels_[slot];
+        if (std::numeric_limits<Quantity>::max() - level.total_quantity() < order.quantity) {
+            if (level.empty()) {
+                remove_occupied_level(slot);
+            }
+            return Status::PriceLevelQuantityOverflow;
+        }
         if (!level.append(order)) {
             if (level.empty()) {
                 remove_occupied_level(slot);
@@ -907,6 +932,27 @@ public:
         }
 
         return Status::Accepted;
+    }
+
+    [[nodiscard]] Status can_accept_residual(const Price price,
+                                             const Quantity residual_quantity) const noexcept
+    {
+        if (residual_quantity == 0) {
+            return Status::Accepted;
+        }
+        if (!price_in_range(price)) {
+            return Status::InternalError;
+        }
+
+        const std::uint32_t slot = find_slot(price);
+        if (slot != kInvalidIndex) {
+            return std::numeric_limits<Quantity>::max() - levels_[slot].total_quantity() <
+                           residual_quantity
+                       ? Status::PriceLevelQuantityOverflow
+                       : Status::Accepted;
+        }
+        return occupied_level_count_ < level_capacity_ ? Status::Accepted
+                                                        : Status::PoolExhausted;
     }
 
     [[nodiscard]] Status can_accept_replacement_residual(const Order& old_order,
@@ -938,7 +984,7 @@ public:
             }
 
             return std::numeric_limits<Quantity>::max() - target_quantity < residual_quantity
-                       ? Status::InternalError
+                       ? Status::PriceLevelQuantityOverflow
                        : Status::Accepted;
         }
 
@@ -955,10 +1001,11 @@ public:
             return Status::InternalError;
         }
 
-        const std::uint32_t slot = find_slot(order.price);
-        if (slot == kInvalidIndex) {
+        const std::uint32_t map_index = find_map_index(order.price);
+        if (map_index == kInvalidIndex) {
             return Status::InternalError;
         }
+        const std::uint32_t slot = level_map_[map_index].slot;
 
         PriceLevel& level = levels_[slot];
         if (order.level != &level || !level.remove(order)) {
@@ -966,7 +1013,7 @@ public:
         }
 
         if (level.empty()) {
-            remove_occupied_level(slot);
+            remove_occupied_level(slot, map_index);
         }
 
         return Status::Accepted;
@@ -1543,13 +1590,18 @@ private:
         return slot;
     }
 
-    void remove_occupied_level(const std::uint32_t slot) noexcept
+    void remove_occupied_level(const std::uint32_t slot,
+                               const std::uint32_t known_map_index = kInvalidIndex) noexcept
     {
         if (slot == kInvalidIndex || !metadata_[slot].occupied) {
             return;
         }
 
-        static_cast<void>(map_erase(metadata_[slot].price));
+        if (known_map_index == kInvalidIndex) {
+            static_cast<void>(map_erase(metadata_[slot].price));
+        } else {
+            static_cast<void>(map_erase_at(known_map_index, metadata_[slot].price));
+        }
         remove_sorted_slot(slot);
         levels_[slot].reset(0);
         metadata_[slot] = LevelMeta{};
@@ -1632,6 +1684,12 @@ private:
 
     [[nodiscard]] std::uint32_t find_slot(const Price price) const noexcept
     {
+        const std::uint32_t index = find_map_index(price);
+        return index == kInvalidIndex ? kInvalidIndex : level_map_[index].slot;
+    }
+
+    [[nodiscard]] std::uint32_t find_map_index(const Price price) const noexcept
+    {
         if (level_map_capacity_ == 0) {
             return kInvalidIndex;
         }
@@ -1643,7 +1701,7 @@ private:
                 return kInvalidIndex;
             }
             if (entry.state == SlotState::Occupied && entry.price == price) {
-                return entry.slot;
+                return index;
             }
             index = (index + 1U) & level_map_mask_;
         }
@@ -1691,27 +1749,26 @@ private:
 
     [[nodiscard]] bool map_erase(const Price price) noexcept
     {
-        if (level_map_capacity_ == 0) {
+        return map_erase_at(find_map_index(price), price);
+    }
+
+    [[nodiscard]] bool map_erase_at(const std::uint32_t index,
+                                    const Price expected_price) noexcept
+    {
+        if (index == kInvalidIndex || index >= level_map_capacity_) {
             return false;
         }
 
-        std::uint32_t index = hash_price(price);
-        for (std::uint32_t probe = 0; probe < level_map_capacity_; ++probe) {
-            MapEntry& entry = level_map_[index];
-            if (entry.state == SlotState::Empty) {
-                return false;
-            }
-            if (entry.state == SlotState::Occupied && entry.price == price) {
-                entry = MapEntry{};
-                entry.state = SlotState::Deleted;
-                --level_map_size_;
-                ++level_map_tombstones_;
-                return true;
-            }
-            index = (index + 1U) & level_map_mask_;
+        MapEntry& entry = level_map_[index];
+        if (entry.state != SlotState::Occupied || entry.price != expected_price) {
+            return false;
         }
 
-        return false;
+        entry = MapEntry{};
+        entry.state = SlotState::Deleted;
+        --level_map_size_;
+        ++level_map_tombstones_;
+        return true;
     }
 
     [[nodiscard]] std::uint32_t hash_price(const Price price) const noexcept
@@ -1803,6 +1860,13 @@ public:
     [[nodiscard]] Status add_order(Order& order) noexcept
     {
         return sparse() ? sparse_side().add_order(order) : dense_side().add_order(order);
+    }
+
+    [[nodiscard]] Status can_accept_residual(const Price price,
+                                             const Quantity residual_quantity) const noexcept
+    {
+        return sparse() ? sparse_side().can_accept_residual(price, residual_quantity)
+                        : dense_side().can_accept_residual(price, residual_quantity);
     }
 
     [[nodiscard]] Status can_accept_replacement_residual(const Order& old_order,

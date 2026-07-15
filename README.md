@@ -13,6 +13,15 @@ exhaustion is reported with explicit `Status` values instead of exceptions, and
 preflight checks avoid partial execution when an operation cannot be recorded
 or stored completely.
 
+**Release status:** the CMake and Python package version is `0.1.0`, and the
+Python distribution is classified Alpha. Eigen-Book is an experimental
+single-process engine and simulation project, not a production trading venue,
+execution gateway, or complete exchange simulator. Public APIs and persisted
+formats may still change before a stable release. The existing `v1.0.0` Git
+tag is legacy historical metadata whose tagged source also declares version
+`0.1.0`; it must not be read as a general-availability claim. See
+[`CHANGELOG.md`](CHANGELOG.md) for the release record and maturity boundary.
+
 ## Quick Review
 
 | Area | Current status |
@@ -20,8 +29,8 @@ or stored completely.
 | Engine contract | C++20, `namespace eigenbook`, strict warnings, no exceptions in hot-path engine code, deterministic behavior after initialization. |
 | Allocation contract | Orders, id lookup, levels, event logs, market-data buffers, snapshot workspace, and routing tables are configured up front. Hot-path add/cancel/modify/replace/dispatch paths use caller-owned or preallocated storage. |
 | Core data structures | `MemoryPool<Order>` for fixed-capacity orders, intrusive doubly linked FIFO queues per price level, dense price-indexed sides or bounded sparse storage, occupancy bitsets for best-price discovery, and fixed-capacity open-addressed order-id lookup. |
-| Matching semantics | FIFO price-time priority, GTC/IOC/FOK limit orders, market orders, O(1) cancel after id lookup, quantity reductions that keep priority, and reject-on-increase modify semantics. Deep semantics stay in [`docs/venue-semantics.md`](docs/venue-semantics.md). |
-| Recovery and data | Fixed-capacity events, incremental market data with sequence/gap detection, representation-independent checksums, deterministic snapshots, and CRC-protected journals. See [`docs/market-data-and-recovery.md`](docs/market-data-and-recovery.md). |
+| Matching semantics | FIFO price-time priority, GTC/IOC/FOK limit orders, market orders, O(1) intrusive cancel unlink after bounded id lookup, quantity reductions that keep priority, and reject-on-increase modify semantics. Complete cancel bounds are in [`docs/architecture.md`](docs/architecture.md#cancellation-complexity). |
+| Recovery and data | Fixed-capacity events, incremental engine market data with sequence/gap detection, representation-independent checksums, deterministic snapshots, and CRC-protected journals. The external replay tape has a separate snapshot-plus-sequenced-depth contract. See [`docs/market-data-and-recovery.md`](docs/market-data-and-recovery.md) and [`docs/sequenced-depth-ml.md`](docs/sequenced-depth-ml.md). |
 | Python package | Optional pybind11 package for CPython 3.10-3.14 on macOS/Linux. Core runtime dependency is NumPy; Gymnasium and Stable-Baselines3 are extras for RL and PPO demos. Windows, PyPy, and portable wheels are not currently tested. |
 
 Build and test from a clean checkout:
@@ -66,7 +75,8 @@ compiler context.
 - fixed-size binary `Command` wire format and `MatchingEngine::dispatch`
 - best-first market depth API with caller-provided buffers
 - deterministic snapshot/restore for books and multi-instrument engines
-- O(1) cancellation after id lookup
+- O(1) intrusive FIFO unlink after id lookup; complete dense and sparse
+  cancellation has explicit configured-capacity bounds
 - quantity reduction that preserves time priority
 - quantity increase rejection
 - explicit replace-order policy with lose-priority reinsert semantics
@@ -82,7 +92,9 @@ compiler context.
 See [`docs/architecture.md`](docs/architecture.md) for data structures,
 [`docs/venue-semantics.md`](docs/venue-semantics.md) for matching rules, and
 [`docs/market-data-and-recovery.md`](docs/market-data-and-recovery.md) for
-sequence, checksum, snapshot, and journal contracts.
+engine sequence, checksum, snapshot, and journal contracts. The external
+snapshot-plus-sequenced-depth replay and model-artifact contract is documented
+in [`docs/sequenced-depth-ml.md`](docs/sequenced-depth-ml.md).
 
 ## Requirements
 
@@ -169,10 +181,14 @@ changing the restore target.
 
 ## Event API
 
-Every mutating operation returns a result struct with `events_emitted` and
-`events`. `events` is a `std::span<const BookEvent>` over the `OrderBook`'s
-internal fixed-capacity `EventLog`; it is valid until the next mutating call on
-the same book.
+Every direct `OrderBook` command returns a result struct with `events_emitted`
+and `events`. `events` is a `std::span<const BookEvent>` over the book's
+internal fixed-capacity `EventLog`; it is valid until the next direct mutating
+call on the same book. Every such call starts a new command-event and
+market-data operation, including a call rejected during argument validation;
+the new spans therefore replace the preceding spans or become empty.
+Structurally invalid/undecodable engine dispatches and unknown instruments do
+not target a book and leave all books' spans untouched.
 
 `BookConfig::event_log_capacity == 0` selects the default operation-safe
 capacity. A nonzero capacity is treated as an explicit cap. If an operation
@@ -209,15 +225,22 @@ for an IOC residual. Rejected commands emit `OrderRejected` with the `Status`
 reason. `TimeInForce` supports `Gtc`, `Ioc`, and `Fok`, and existing calls
 default to GTC behavior.
 
+A GTC residual that would overflow its same-side price aggregate rejects with
+`Status::PriceLevelQuantityOverflow` before `OrderAccepted`, matching, order
+allocation, or sequence advancement. Its synchronous `OrderRejected` event has
+the reserved sequence value zero; the FIFO, sequenced command-event, and
+market-data checkpoints remain unchanged.
+
 ## Multi-Instrument Routing And Depth
 
 `MatchingEngine` owns a fixed number of instrument books and a fixed
 open-addressed lookup table built during initialization. Use
 `MatchingEngine::create(...)` to receive either a fully initialized engine or a
 `MatchingEngineCreateResult` with the exact `MatchingEngineInitError` and
-failing configuration index. Hot-path routing uses bounded O(1) lookup by
-`InstrumentId`; unknown instruments return `Status::UnknownInstrument` without
-mutating any book or emitting events.
+failing configuration index. Hot-path routing uses average O(1) lookup by
+`InstrumentId`, with worst-case work bounded by the configured fixed table;
+unknown instruments return `Status::UnknownInstrument` without mutating any
+book or emitting events.
 
 ```cpp
 #include "MatchingEngine.hpp"
@@ -264,7 +287,7 @@ returns the number of levels written. Bid levels are best-first descending by
 price; ask levels are best-first ascending by price. Each `DepthLevel` contains
 `price`, `aggregate_quantity`, and `order_count`.
 
-## Production API
+## Audited API Contract
 
 | Surface | Contract |
 |---|---|
@@ -273,12 +296,12 @@ price; ask levels are best-first ascending by price. Each `DepthLevel` contains
 | Stats | `MatchingEngine::stats()` keeps existing utilization fields and adds dispatch op counters, total rejects, `rejects_by_status`, decode errors, and event-log high-water mark. |
 | Venue command | `VenueCommand` extends the legacy command with participant id and post-only without changing the 39-byte command wire contract. |
 | Market data | Per-instrument fixed-capacity events use contiguous sequence numbers. Rejected/no-change commands consume no market-data sequence. |
-| Snapshot | Snapshot wire format version 3 preserves venue state plus command-event and market-data sequences. Versions are exactly matched. |
+| Snapshot | Snapshot wire format version 4 preserves venue state, public resting-order `initial_quantity`/`state`, and command-event/market-data sequences. Versions are exactly matched. |
 | Journal | `dispatch_and_record` produces one 144-byte little-endian CRC32-protected v1 record; `replay_journal` verifies status, events, sequences, and state checksum after every command. |
 | Sparse mode | `PriceLevelMode::Sparse` avoids dense allocation across wide price universes while preserving fixed capacity and bounded behavior. |
 | TIF | Limit adds and lose-priority replaces support `Gtc`, `Ioc`, and `Fok`; FOK preflights full quantity before mutation. |
 | Replace policy | Same-price reductions keep priority. Price changes and same-price increases use cancel/reinsert semantics and lose priority. |
-| Event lifetime | Result `events` spans are owned by the target `OrderBook` and remain valid until the next mutating call on that same book. `EventLogFull` returns an empty span with no mutation. |
+| Event lifetime | Result `events` and market-data spans are owned by the target `OrderBook` and remain valid until its next direct mutating command call, including a validation failure. `EventLogFull` returns an empty span with no book mutation. |
 
 ## Usage Example
 
@@ -303,7 +326,7 @@ memory and configured-capacity bounds are documented in
 `decode` and `MatchingEngine::dispatch` across two instruments, printing event
 summaries and aggregate stats.
 
-`examples/journal_usage.cpp` shows venue-aware bounded record production and
+`examples/journal_usage.cpp` shows venue-aware bounded record generation and
 deterministic recovery into a separately constructed engine.
 
 Build and run it from any configured build directory:
@@ -365,7 +388,7 @@ mixed workloads, replay dispatch, and snapshot workloads. See
 `docs/performance.md` for methodology,
 local recorded results, and limitations.
 Do not update benchmark numbers without rerunning locally and recording
-hardware/compiler context.
+hardware, compiler, flags, timestamp, Git commit, and dirty-worktree state.
 
 Set `-DEIGENBOOK_BUILD_BENCHMARKS=OFF` to skip building benchmarks.
 
@@ -388,10 +411,10 @@ ctest --test-dir build-sanitize
 ## Optional Fuzzing
 
 Clang builds can enable dependency-free libFuzzer harnesses for the command
-decoder, snapshot restore path, and stateful differential engine behavior. Each
-fuzzer is compiled with libFuzzer, AddressSanitizer, and
-UndefinedBehaviorSanitizer; fuzzing remains outside the matching engine and is
-disabled by default.
+decoder, snapshot restore path, stateful differential engine behavior, and
+journal decode/replay. Each fuzzer is compiled with libFuzzer,
+AddressSanitizer, and UndefinedBehaviorSanitizer; fuzzing remains outside the
+matching engine and is disabled by default.
 
 ```sh
 cmake -S . -B build-fuzz \
@@ -400,14 +423,12 @@ cmake -S . -B build-fuzz \
   -DEIGENBOOK_BUILD_FUZZERS=ON \
   -DEIGENBOOK_BUILD_BENCHMARKS=OFF \
   -DEIGENBOOK_BUILD_EXAMPLES=OFF
-cmake --build build-fuzz --parallel \
-  --target eigenbook_command_fuzzer eigenbook_snapshot_fuzzer \
-  eigenbook_stateful_fuzzer
+cmake --build build-fuzz --parallel
 ```
 
-The build deterministically generates valid command, dense snapshot, sparse
-snapshot, and stateful regression seeds under `build-fuzz/fuzz-corpus`. Run
-longer local campaigns with:
+The build deterministically generates valid command, dense/sparse snapshot,
+stateful venue/STP, and valid/corrupt journal seeds under
+`build-fuzz/fuzz-corpus`. Run longer local campaigns with:
 
 ```sh
 ./build-fuzz/eigenbook_command_fuzzer \
@@ -418,6 +439,10 @@ longer local campaigns with:
   -max_len=4096 -max_total_time=300 \
   -artifact_prefix=build-fuzz/fuzz-artifacts/ \
   build-fuzz/fuzz-corpus/stateful
+./build-fuzz/eigenbook_journal_fuzzer \
+  -max_len=4096 -max_total_time=300 \
+  -artifact_prefix=build-fuzz/fuzz-artifacts/ \
+  build-fuzz/fuzz-corpus/journal
 ```
 
 Re-run a saved crash artifact by passing its path directly to the corresponding
@@ -433,10 +458,10 @@ ctest --test-dir build-fuzz --output-on-failure -L fuzz
 
 Focused `clang-tidy` analysis is opt-in and does not affect normal builds. It
 requires `clang-tidy` 18 or newer; Eigen-Book CI is pinned to version 18. The
-configured checks cover Clang's core, C++ lifetime, and dead-code analyzers plus
-selected dangling-handle, narrowing, undefined-memory, use-after-move, and
-unnecessary-copy performance checks. Style-only check families are
-intentionally excluded.
+configured checks cover all public production headers with Clang's core, C++
+lifetime, and dead-code analyzers plus selected dangling-handle, narrowing,
+undefined-memory, use-after-move, and unnecessary-copy performance checks.
+Style-only check families are intentionally excluded.
 
 ```sh
 cmake -S . -B build-analysis \
@@ -501,12 +526,11 @@ The core Python API intentionally covers the low-risk simulation boundary:
 - copied `DispatchResult` scalars, including STP counters and
   `market_data_events_emitted`.
 
-Python does not currently bind snapshot/restore, journal record production,
+Python does not currently bind snapshot/restore, journal record generation,
 journal replay, command wire encode/decode helpers, `MarketDataEvent` payload
 buffers, gap detection, stats structs, or direct `OrderBook` methods. Use the
-C++ API for production recovery, persistence, and incremental market-data
-payload workflows until those bindings have dedicated buffer contracts and
-tests.
+C++ API for recovery, persistence, and incremental market-data payload
+workflows until those bindings have dedicated buffer contracts and tests.
 
 `dispatch_with_buffer(command, events)` copies the emitted native records into
 the caller-owned NumPy array and returns the valid prefix length.
@@ -559,6 +583,8 @@ env = LimitOrderBookEnv(
     instrument,
     max_episode_steps=1_000,
     max_abs_inventory=100,
+    maker_fee_rate=0.0002,
+    taker_fee_rate=0.0005,
 )
 observation, info = env.reset(seed=7)
 observation, reward, terminated, truncated, info = env.step(
@@ -567,121 +593,154 @@ observation, reward, terminated, truncated, info = env.step(
 ```
 
 Actions are `[side, centered_price_offset, quantity_code]`. Observations are a
-reused `(2, 5, 2)` float32 bid/ask depth buffer. Reward is aggressive executed
-quantity minus residual quantity. Quantity code `n` submits `n + 1` configured
-lots; when lot-size enforcement is disabled, one lot is one quantity unit.
-Inventory counts aggressive buy fills
-positively and sell fills negatively; previously resting actions are treated
-as book liquidity for this accounting. The inventory boundary terminates an
-episode and the step limit truncates it. Calling `step` before `reset` or after
-episode completion is an error. `reset(options=...)` accepts
-`initial_inventory` and rejects unknown options. Seeded action sampling and
-engine transitions are deterministic. Copy returned observations and info
-mappings before retaining them.
+reused `(2, 5, 2)` float32 bid/ask depth buffer. Quantity code `n` submits
+`n + 1` configured lots; when lot-size enforcement is disabled, one lot is one
+quantity unit.
+
+The environment maintains cash, inventory, cumulative fees, and mark-to-market
+wealth. Each trade is booked at its exact event price, with the configured
+maker or taker fee debited from cash. The baseline reward is the change in
+`cash + inventory * L1_mid` since the preceding step. A two-sided Level 1 book
+sets the mark; empty and one-sided states retain the last valid midpoint, with
+the configured reference price used at reset. Prices, quantities, cash, and
+wealth remain in native engine units, so callers must apply their venue's
+price and quantity scales when presenting dollar PnL.
+
+Previously submitted actions remain agent-owned orders. If one agent action
+crosses another, both financial legs and both fees are accounted. External
+commands that may fill agent orders should use
+`env.dispatch_external_transition(command)`. It checks the native result and
+returns observation, reward, termination state, copied result, and info after
+inventory, cash, maker/taker fees, mark, and wealth have all been updated in
+that same transition. A rejected native status raises `ExternalDispatchError`.
+The older `dispatch_external(command)` method remains a deferred-reporting
+compatibility API. The inventory boundary terminates an episode and the step
+limit truncates it. Calling `step` before `reset` or after episode completion
+is an error. `reset(options=...)` accepts `initial_inventory` and
+`initial_cash` and rejects unknown options. For a fixed seed, command stream,
+and engine build, action-space sampling and integer engine transitions are
+repeatable. This engine-level property is not a bit-for-bit reproducibility
+guarantee for PPO training or inference across dependency builds, operating
+systems, or hardware. Copy returned observations and info mappings before
+retaining them.
 
 Importing `eigenbook` does not import Gymnasium. Accessing the environment
 without the extra raises an error containing the exact installation command.
 
-### PPO Demonstration Pipeline
+### Sequenced Depth And PPO Pipeline
 
-The repository includes a Stable-Baselines3 PPO demonstration in
-`scripts/train_ppo.py`. Install the dedicated optional dependencies from a
-checkout, then run the default 100,000-requested-timestep workload:
+The policy experiment consumes one versioned market-data format: an initial
+depth snapshot followed by continuous, source-identified depth updates and,
+in `depth_trades` mode, aggregate trades. Binance `bookTicker` is BBO/L1, not
+depth, and is rejected. The old five-column CSV is preserved as a legacy
+artifact but is not reinterpreted.
+
+This is an offline research simulation path. It does not provide historical
+backfill, complete L2 fidelity, true order-level queue reconstruction, or live
+order transmission.
+
+Install the training dependencies, capture a live Binance Spot interval, and
+train with matching symbol, venue, and scales:
 
 ```sh
 python -m pip install '.[training]'
-python scripts/train_ppo.py
+
+python fetch_l2_data.py \
+  --symbol BTCUSDT \
+  --start 2026-07-16T13:00:00Z \
+  --end 2026-07-16T13:05:00Z \
+  --destination market-data/BTCUSDT-binance-spot-depth-trades.csv \
+  --data-mode depth_trades \
+  --price-scale 100 \
+  --quantity-scale 100000
+
+python experiments/train_market_data.py \
+  --market-data market-data/BTCUSDT-binance-spot-depth-trades.csv \
+  --evaluation-market-data market-data/BTCUSDT-binance-spot-evaluation.csv \
+  --symbol BTCUSDT \
+  --venue binance_spot \
+  --data-mode depth_trades \
+  --price-scale 100 \
+  --quantity-scale 100000 \
+  --model-path training-output/ppo_eigenbook_depth
 ```
 
-The training extra constrains Gymnasium to `>=1.2,<1.4` and
-Stable-Baselines3 to `>=2.9,<3`; Stable-Baselines3 supplies its compatible
-PyTorch dependency.
+The downloader is a live recorder, not a historical backfill service. It
+opens the diff-depth stream before fetching the initial REST snapshot,
+requires the first retained update to bridge the snapshot id, preserves source
+depth, aggregate-trade, and raw-trade ids, validates their continuity and the
+complete tape, and atomically renames a
+temporary file only after success. A gap, crossed/locked atomic event, invalid
+decimal precision, or unsupported source event fails closed. Tape-validation
+diagnostics include source ids and the physical CSV row or row range; source
+stream diagnostics include the available source identifiers.
 
-Generated models default to `training-output/ppo_eigenbook_agent.zip`. The
-directory and conventional `ppo_*.zip` model names are ignored by Git. An
-existing output file is replaced. A shorter development run is:
+CSV rows are grouped by consecutive `event_id`, never timestamp. One source
+message may update several bid and ask levels; all of its rows are validated
+and committed together. The event reaches `FeatureExtractor` once and its rows
+never become separate latency ticks. Reset returns only after the initial
+snapshot and its required sequenced bridge are both applied. A later snapshot
+replaces depth, cancels active/pending agent quotes, and consumes its required
+bridge before another policy observation; no fill or latency activation can
+occur in the intermediate recovery state. A gap marks the feed unsynchronized
+and stops replay until reset/resnapshot.
+
+The canonical policy observation is the versioned 23-value causal market,
+inventory, active-order, and pending-latency layout in
+[`docs/sequenced-depth-ml.md`](docs/sequenced-depth-ml.md). Training,
+evaluation, reload, and paper replay use the same wrapper and action schema.
+Every model archive requires a `.metadata.json` sidecar recording schema and
+fill-model versions, tape mode, ordered fields and exact Gym spaces, scales,
+symbol, venue, fees, inventory-penalty rate, feature/replay configuration, and
+dependency versions. Missing or mismatched metadata is rejected before model
+parameters are loaded.
+
+The seed and compatibility checks support controlled repeat runs, not portable
+deterministic ML results. PPO parameters, actions, and evaluation rewards may
+differ across Torch/BLAS builds, operating systems, CPU/GPU backends, and
+hardware even when the tape, seed, and declared package versions match.
+
+Paper replay uses the same tape and compatibility checks and transmits no
+orders:
 
 ```sh
-python scripts/train_ppo.py \
-  --training-timesteps 4096 \
-  --evaluation-steps 250 \
-  --seed 23 \
-  --ppo-rollout-steps 512 \
-  --ppo-batch-size 64 \
-  --model-output training-output/ppo_development_agent \
-  --verbose
+python experiments/paper_trader.py \
+  --market-data market-data/BTCUSDT-binance-spot-evaluation.csv \
+  --model training-output/ppo_eigenbook_depth.zip \
+  --maximum-steps 10000
 ```
 
-The CLI accepts:
-
-- `--training-timesteps`: positive requested learning horizon. PPO finishes
-  its current rollout, so the actual learned timestep count can be higher.
-- `--evaluation-steps`: positive maximum length of the single deterministic
-  evaluation episode.
-- `--seed`: integer from 0 through 2^32 - 1.
-- `--ppo-rollout-steps`: samples collected before each PPO update.
-- `--ppo-batch-size`: minibatch size. It must not exceed, and must evenly
-  divide, the rollout size.
-- `--model-output`: output archive path; `.zip` is appended when absent.
-- `--quiet`: suppress routine output.
-- `--verbose`: include Stable-Baselines3 training metrics. The default mode
-  prints only pipeline progress and the result summary.
-
-Use `python scripts/train_ppo.py --help` for defaults and validation details.
-A successful normal-mode run validates the Gymnasium API, trains the model,
-saves and reloads the archive, and prints deterministic evaluation reward,
-step count, and termination state. The pipeline uses Gymnasium's standard
-flatten-observation wrapper for PPO without changing `LimitOrderBookEnv`'s
-public `(2, 5, 2)` observation API.
-
-```text
-[setup] Using deterministic seed 7 on CPU.
-[validation] Checking the Gymnasium environment.
-[training] Requesting 100,000 PPO timesteps.
-...
-[persistence] Saved model to .../ppo_eigenbook_agent.zip.
-[persistence] Reloaded model; evaluating up to 1,000 steps.
-[results] reward=..., steps=..., terminated=..., truncated=...
-```
-
-The seed is applied to Python, NumPy, Gymnasium spaces and resets,
-Stable-Baselines3, and Torch. Training is forced onto CPU and Torch
-deterministic algorithms are enabled. Identical results are still not
-guaranteed across operating systems, processors, BLAS implementations, Torch
-versions, or Stable-Baselines3 versions. Record the seed, dependency versions,
-and hardware when comparing experiments.
-
-This agent is a software integration demonstration, not a validated trading
-strategy. Its synthetic environment has no historical order flow, fees,
-latency, market impact, or out-of-sample profitability assessment. Evaluation
-reward demonstrates deterministic execution of this toy objective; it is not
-evidence of trading performance.
-
-An untested historical-market-data experiment lives in
-`experiments/train_market_data.py`. It is intentionally outside `tests/`
-because it requires a local Binance aggregate-trades CSV and writes
-TensorBoard/model artifacts. Use `scripts/train_ppo.py` for the maintained
-package demonstration.
+Passive fills are explicitly approximate. A quote/depth move alone never
+fills an agent order. Only an opposite-side aggressive trade at the exact
+resting price supplies evidence; reported quantity consumes displayed
+same-price volume ahead first and can then create a capped partial fill. A
+depth-only move through a resting quote cancels it as an unconfirmed cross; it
+does not manufacture a fill. Trade evidence at or before order activation, or
+behind the current source-time watermark, is counted as uncertain and ignored
+for execution. Terminal liquidation is capped by displayed quantity and
+reports any residual inventory instead of throwing. True
+queue position, hidden liquidity, price-through fills, order-level
+cancellations, market impact, and achievable execution are not modeled. The
+complete source, atomicity, fill, accounting, observation, metadata, and
+legacy-artifact migration contracts are in
+[`docs/sequenced-depth-ml.md`](docs/sequenced-depth-ml.md).
 
 ### Python Tests And Wheel Validation
 
-Run core, RL, and PPO training tests from an installed package:
+Run the core suite, then the complete all-extras suite, from an installed
+package:
 
 ```sh
 python -m pip install '.[test]'
-python -m pytest tests/test_python_bindings.py \
-  tests/test_numpy_event_buffer.py tests/test_packaging.py
+python -m pytest -m "not rl and not training"
 
-python -m pip install '.[rl]'
-python -m pytest tests/test_eigenbook_env.py
-
-python -m pip install '.[training,test]'
-python -m pytest tests/test_train_ppo.py
+python -m pip install '.[rl,training,benchmark,test]'
+python -m pytest
 ```
 
-Build a local wheel with `python -m build --wheel`. CI installs that wheel into
-a fresh virtual environment and runs imports and core tests outside the source
-tree.
+Build a local wheel with `python -m build --wheel`. CI installs that wheel with
+all extras into a fresh virtual environment and runs the complete test suite
+outside the source tree.
 
 The Python benchmark is separate from correctness tests:
 
@@ -724,15 +783,15 @@ supported way to combine it with the Python sources into an installable wheel.
 ## CI
 
 GitHub Actions is configured in `.github/workflows/ci.yml`. It runs Debug,
-Release, and combined ASAN/UBSAN builds, runs deterministic tests under the
-sanitizers, explicitly runs the zero-allocation hot-path guard in Debug and
-Release, runs the installed-package CMake consumer smoke, and compiles the
-benchmark target without running benchmark timing in CI. Installed core-package
-tests cover CPython 3.10 through 3.14 without Gymnasium; separate jobs install
-the RL extra, run a Python 3.12 PPO
-train-save-load-evaluate smoke cycle entirely under the runner temporary
-directory, and build/install a wheel in a clean environment. No job publishes
-packages. Separate Clang 18 jobs run focused static analysis and fixed-run
-libFuzzer smoke tests, preserving any failing fuzz artifact. The guarded
-boundary and tracker limitations are documented in
+Release, combined ASAN/UBSAN, Ninja multi-config, and macOS native builds,
+including the zero-allocation guard, installed-package CMake consumer, strict
+warnings, and 20-operation text/JSON benchmark smokes without latency
+thresholds. Ruff lint/format checks run separately. Installed core-package
+tests cover CPython 3.10 through 3.14 without Gymnasium; an all-extras job runs
+the complete suite and a Python 3.12 PPO train-save-load-evaluate smoke under
+the runner temporary directory. A separate job builds a wheel, installs it
+with all extras in a clean environment, and reruns the complete suite outside
+the source tree. No job publishes packages. Clang 18 jobs run focused static
+analysis and bounded libFuzzer smoke tests, preserving any failing fuzz
+artifact. The guarded boundary and tracker limitations are documented in
 [`docs/architecture.md`](docs/architecture.md#enforced-zero-allocation-boundary).

@@ -24,10 +24,7 @@ def test_installed_distribution_and_native_module() -> None:
     native_spec = importlib.util.find_spec("eigenbook._eigenbook")
     assert native_spec is not None
     assert native_spec.origin is not None
-    assert any(
-        native_spec.origin.endswith(suffix)
-        for suffix in EXTENSION_SUFFIXES
-    )
+    assert any(native_spec.origin.endswith(suffix) for suffix in EXTENSION_SUFFIXES)
 
 
 def test_import_works_in_isolated_mode_from_outside_repository(

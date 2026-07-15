@@ -615,6 +615,8 @@ private:
         result.last_price = source.last_price;
         result.events_emitted = source.events_emitted;
         result.events = source.events;
+        result.aggressor_cancelled_by_stp = source.aggressor_cancelled_by_stp;
+        result.resting_orders_cancelled_by_stp = source.resting_orders_cancelled_by_stp;
         return result;
     }
 
@@ -654,6 +656,8 @@ private:
         result.last_price = source.last_price;
         result.events_emitted = source.events_emitted;
         result.events = source.events;
+        result.aggressor_cancelled_by_stp = source.aggressor_cancelled_by_stp;
+        result.resting_orders_cancelled_by_stp = source.resting_orders_cancelled_by_stp;
         return result;
     }
 
@@ -769,6 +773,7 @@ private:
         case Status::JournalChecksumMismatch:
         case Status::JournalInvalidField:
         case Status::ReplayDiverged:
+        case Status::PriceLevelQuantityOverflow:
             return true;
         }
 

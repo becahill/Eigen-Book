@@ -1,6 +1,8 @@
 #include "BookSide.hpp"
 #include "Command.hpp"
 #include "EventLog.hpp"
+#include "Journal.hpp"
+#include "MarketData.hpp"
 #include "MatchingEngine.hpp"
 #include "MemoryPool.hpp"
 #include "Order.hpp"
@@ -8,6 +10,7 @@
 #include "OrderIdMap.hpp"
 #include "PriceLevel.hpp"
 #include "Snapshot.hpp"
+#include "SnapshotValidationWorkspace.hpp"
 #include "Types.hpp"
 
 namespace eigenbook::analysis {

@@ -37,9 +37,7 @@ def make_instrument(
 ) -> eb.InstrumentConfig:
     config = eb.InstrumentConfig()
     config.instrument_id = instrument_id
-    config.book_config = (
-        book_config if book_config is not None else make_book_config()
-    )
+    config.book_config = book_config if book_config is not None else make_book_config()
     config.tick_size = 1
     config.lot_size = lot_size
     config.self_trade_policy = self_trade_policy

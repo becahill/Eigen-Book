@@ -117,6 +117,9 @@ void check_add_result(const AddOrderResult& actual, const AddOrderResult& expect
     CHECK(actual.fills == expected.fills);
     CHECK(actual.has_last_price == expected.has_last_price);
     CHECK(actual.last_price == expected.last_price);
+    CHECK(actual.aggressor_cancelled_by_stp == expected.aggressor_cancelled_by_stp);
+    CHECK(actual.resting_orders_cancelled_by_stp ==
+          expected.resting_orders_cancelled_by_stp);
     check_result_events(actual, expected, context);
 }
 
@@ -147,6 +150,9 @@ void check_replace_result(const ReplaceResult& actual, const ReplaceResult& expe
     CHECK(actual.fills == expected.fills);
     CHECK(actual.has_last_price == expected.has_last_price);
     CHECK(actual.last_price == expected.last_price);
+    CHECK(actual.aggressor_cancelled_by_stp == expected.aggressor_cancelled_by_stp);
+    CHECK(actual.resting_orders_cancelled_by_stp ==
+          expected.resting_orders_cancelled_by_stp);
     check_result_events(actual, expected, context);
 }
 
@@ -159,6 +165,9 @@ void check_match_result(const MatchResult& actual, const MatchResult& expected, 
     CHECK(actual.fills == expected.fills);
     CHECK(actual.has_last_price == expected.has_last_price);
     CHECK(actual.last_price == expected.last_price);
+    CHECK(actual.aggressor_cancelled_by_stp == expected.aggressor_cancelled_by_stp);
+    CHECK(actual.resting_orders_cancelled_by_stp ==
+          expected.resting_orders_cancelled_by_stp);
     check_result_events(actual, expected, context);
 }
 
@@ -340,6 +349,29 @@ public:
             return finish_result(result);
         }
 
+        if (time_in_force == TimeInForce::Gtc && executable < quantity) {
+            const auto* const target_level = level_at(side, price);
+            const Quantity residual_quantity = quantity - executable;
+            if (target_level != nullptr &&
+                std::numeric_limits<Quantity>::max() - level_depth(*target_level) <
+                    residual_quantity) {
+                result.accepted_quantity = 0;
+                result.status = Status::PriceLevelQuantityOverflow;
+                if (!start_event_operation(1)) {
+                    return event_log_full_result(result);
+                }
+                event_log_.append_unsequenced_order(BookEvent::Kind::OrderRejected,
+                                                    result.status,
+                                                    id,
+                                                    side,
+                                                    price,
+                                                    quantity,
+                                                    timestamp,
+                                                    time_in_force);
+                return finish_result(result);
+            }
+        }
+
         if (time_in_force == TimeInForce::Gtc &&
             (id_slot_status != Status::Accepted || live_order_count_ == config_.max_orders) &&
             executable < quantity) {
@@ -400,7 +432,7 @@ public:
         if (target_level != nullptr &&
             std::numeric_limits<Quantity>::max() - level_depth(*target_level) <
                 match_result.remaining_quantity) {
-            result.status = Status::InternalError;
+            result.status = Status::PriceLevelQuantityOverflow;
             return finish_result(result);
         }
 
@@ -663,16 +695,29 @@ public:
                 if (!start_event_operation(1)) {
                     return event_log_full_result(result);
                 }
-                event_log_.append_order(BookEvent::Kind::OrderRejected,
-                                        result.status,
-                                        id,
-                                        side,
-                                        new_price,
-                                        new_quantity,
-                                        timestamp,
-                                        time_in_force,
-                                        old_quantity,
-                                        new_quantity);
+                if (result.status == Status::PriceLevelQuantityOverflow) {
+                    event_log_.append_unsequenced_order(BookEvent::Kind::OrderRejected,
+                                                        result.status,
+                                                        id,
+                                                        side,
+                                                        new_price,
+                                                        new_quantity,
+                                                        timestamp,
+                                                        time_in_force,
+                                                        old_quantity,
+                                                        new_quantity);
+                } else {
+                    event_log_.append_order(BookEvent::Kind::OrderRejected,
+                                            result.status,
+                                            id,
+                                            side,
+                                            new_price,
+                                            new_quantity,
+                                            timestamp,
+                                            time_in_force,
+                                            old_quantity,
+                                            new_quantity);
+                }
                 return finish_result(result);
             }
         }
@@ -980,7 +1025,7 @@ private:
                 target_quantity -= old_order.quantity;
             }
             return std::numeric_limits<Quantity>::max() - target_quantity < residual_quantity
-                       ? Status::InternalError
+                       ? Status::PriceLevelQuantityOverflow
                        : Status::Accepted;
         }
 
@@ -2177,12 +2222,91 @@ void test_reference_oracle_models_price_level_quantity_overflow()
     const AddOrderResult expected_result = expected.add_limit_order(
         2, Side::Sell, -10, std::numeric_limits<Quantity>::max(), 2);
     check_add_result(actual_result, expected_result, "price_level_quantity_overflow");
-    CHECK(actual_result.status == Status::InternalError);
+    CHECK(actual_result.status == Status::PriceLevelQuantityOverflow);
+    CHECK(actual_result.accepted_quantity == 0U);
+    CHECK(actual_result.events_emitted == 1U);
+    CHECK(actual_result.events[0].kind == BookEvent::Kind::OrderRejected);
+    CHECK(actual_result.events[0].status == Status::PriceLevelQuantityOverflow);
+    CHECK(actual_result.events[0].sequence == 0U);
     CHECK(actual.find_order(1) != nullptr);
     CHECK(actual.find_order(2) == nullptr);
     CHECK(actual.depth_at_price(Side::Sell, -10) ==
           std::numeric_limits<Quantity>::max());
     check_books_equal(actual, expected);
+}
+
+void test_price_level_quantity_overflow_rejection_is_atomic()
+{
+    constexpr std::array<PriceLevelMode, 2> modes{
+        PriceLevelMode::Dense,
+        PriceLevelMode::Sparse,
+    };
+    constexpr std::array<std::uint32_t, 2> market_data_capacities{0U, 16U};
+    constexpr Quantity max_quantity = std::numeric_limits<Quantity>::max();
+
+    for (const PriceLevelMode mode : modes) {
+        for (const std::uint32_t market_data_capacity : market_data_capacities) {
+            BookConfig config{};
+            config.min_price = 90;
+            config.max_price = 110;
+            config.max_orders = 4;
+            config.order_id_map_capacity = 8;
+            config.tick_size = 1;
+            config.event_log_capacity = 8;
+            config.price_level_mode = mode;
+            config.market_data_capacity = market_data_capacity;
+
+            OrderBook book(config, 77);
+            const AddOrderResult initial =
+                book.add_limit_order(1, Side::Buy, 100, max_quantity, 1);
+            CHECK(initial.status == Status::Accepted);
+            CHECK(initial.events_emitted == 2U);
+
+            const std::uint64_t checksum_before = book.state_checksum();
+            const std::uint32_t live_orders_before = book.live_order_count();
+            const SequenceNumber fifo_sequence_before = book.fifo_sequence();
+            const SequenceNumber event_sequence_before = book.event_sequence();
+            const SequenceNumber market_data_sequence_before =
+                book.market_data_sequence();
+
+            const AddOrderResult rejected =
+                book.add_limit_order(2, Side::Buy, 100, 1, 2);
+            CHECK(rejected.status == Status::PriceLevelQuantityOverflow);
+            CHECK(rejected.accepted_quantity == 0U);
+            CHECK(rejected.executed_quantity == 0U);
+            CHECK(rejected.resting_quantity == 0U);
+            CHECK(rejected.events_emitted == 1U);
+            CHECK(rejected.events.size() == 1U);
+            check_order_event_fields(rejected.events[0],
+                                     BookEvent::Kind::OrderRejected,
+                                     Status::PriceLevelQuantityOverflow,
+                                     2,
+                                     Side::Buy,
+                                     100,
+                                     1,
+                                     2,
+                                     77);
+            CHECK(rejected.events[0].sequence == 0U);
+            CHECK(book.last_events().size() == 1U);
+            CHECK(book.last_market_data_events().empty());
+
+            CHECK(book.state_checksum() == checksum_before);
+            CHECK(book.live_order_count() == live_orders_before);
+            CHECK(book.find_order(1) != nullptr);
+            CHECK(book.find_order(2) == nullptr);
+            CHECK(book.depth_at_price(Side::Buy, 100) == max_quantity);
+            CHECK(book.order_count_at_price(Side::Buy, 100) == 1U);
+            CHECK(book.fifo_sequence() == fifo_sequence_before);
+            CHECK(book.event_sequence() == event_sequence_before);
+            CHECK(book.market_data_sequence() == market_data_sequence_before);
+
+            const AddOrderResult following =
+                book.add_limit_order(3, Side::Buy, 99, 1, 3);
+            CHECK(following.status == Status::Accepted);
+            CHECK(following.events[0].sequence == event_sequence_before + 1U);
+            CHECK(book.fifo_sequence() == fifo_sequence_before + 1U);
+        }
+    }
 }
 
 [[nodiscard]] Price random_valid_price(SplitMix64& rng) noexcept
@@ -2479,15 +2603,26 @@ void test_replace_rejects_when_residual_level_cannot_store_quantity()
     run_add(actual, expected, 1, Side::Buy, 100, 5, 1);
     run_add(actual, expected, 2, Side::Buy, 101, max_quantity - 5U, 2);
 
+    const SequenceNumber fifo_sequence_before = actual.fifo_sequence();
+    const SequenceNumber event_sequence_before = actual.event_sequence();
+    const std::uint64_t checksum_before = actual.state_checksum();
     const ReplaceResult actual_result = actual.replace_order(1, 101, 6, 3, TimeInForce::Gtc);
     const ReplaceResult expected_result = expected.replace_order(1, 101, 6, 3, TimeInForce::Gtc);
     check_replace_result(actual_result, expected_result, "replace_residual_quantity_capacity");
     check_books_equal(actual, expected);
 
-    CHECK(actual_result.status == Status::InternalError);
+    CHECK(actual_result.status == Status::PriceLevelQuantityOverflow);
     CHECK(actual_result.events_emitted == 1);
     check_order_event_fields(
-        actual_result.events[0], BookEvent::Kind::OrderRejected, Status::InternalError, 1, Side::Buy, 101, 6, 3);
+        actual_result.events[0],
+        BookEvent::Kind::OrderRejected,
+        Status::PriceLevelQuantityOverflow,
+        1,
+        Side::Buy,
+        101,
+        6,
+        3);
+    CHECK(actual_result.events[0].sequence == 0U);
     CHECK(actual_result.events[0].old_quantity == 5);
     CHECK(actual_result.events[0].new_quantity == 6);
 
@@ -2502,6 +2637,9 @@ void test_replace_rejects_when_residual_level_cannot_store_quantity()
     CHECK(actual.live_order_count() == 2);
     CHECK(actual.depth_at_price(Side::Buy, 100) == 5);
     CHECK(actual.depth_at_price(Side::Buy, 101) == max_quantity - 5U);
+    CHECK(actual.fifo_sequence() == fifo_sequence_before);
+    CHECK(actual.event_sequence() == event_sequence_before);
+    CHECK(actual.state_checksum() == checksum_before);
 }
 
 void test_replace_event_log_full_preserves_book()
@@ -2757,8 +2895,157 @@ void test_order_id_map_probe_stats()
     CHECK(map.erase(first.id));
     stats = map.stats();
     CHECK(stats.size == 1);
-    CHECK(stats.tombstones == 1);
+    CHECK(stats.tombstones == 0);
     CHECK(histogram_total(stats) == 5);
+}
+
+void test_order_id_map_backward_shift_deletion()
+{
+    // These IDs collide in an eight-slot map under OrderIdMap's splitmix64
+    // hash. Erasing from the middle exercises backward shifting, including
+    // preservation of every displaced entry's lookup path.
+    constexpr std::array<OrderId, 6> ids{9, 19, 20, 24, 28, 39};
+    std::array<Order, ids.size()> orders{};
+    OrderIdMap map(8);
+
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        orders[i].reset(ids[i], Side::Buy, 100, 1);
+        CHECK(map.insert(ids[i], &orders[i]) == Status::Accepted);
+    }
+
+    CHECK(map.erase(ids[2]));
+    // Three probes locate ids[2], then three displaced entries are shifted.
+    CHECK(map.stats().last_probe_count == 6U);
+    CHECK(map.find(ids[2]) == nullptr);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        if (i != 2U) {
+            CHECK(map.find(ids[i]) == &orders[i]);
+        }
+    }
+    CHECK(map.tombstones() == 0U);
+    CHECK(map.stats().tombstones == 0U);
+
+    CHECK(map.insert(ids[2], &orders[2]) == Status::Accepted);
+    CHECK(map.find(ids[2]) == &orders[2]);
+
+    // Repeated erasure must return the map to truly empty slots. A missing
+    // lookup then terminates at its first probe instead of scanning tombstones.
+    for (const OrderId id : ids) {
+        CHECK(map.erase(id));
+    }
+    CHECK(map.size() == 0U);
+    CHECK(map.find(999) == nullptr);
+    CHECK(map.stats().last_probe_count == 1U);
+}
+
+void test_order_id_map_robin_hood_early_miss_and_full_table_bound()
+{
+    // The first four ids hash to bucket four. The final id hashes to bucket
+    // zero and therefore forms a Robin Hood cluster boundary after wraparound.
+    constexpr std::array<OrderId, 5> early_miss_ids{9, 19, 20, 24, 6};
+    std::array<Order, early_miss_ids.size()> early_miss_orders{};
+    OrderIdMap early_miss_map(8);
+    for (std::size_t i = 0; i < early_miss_ids.size(); ++i) {
+        early_miss_orders[i].reset(early_miss_ids[i], Side::Buy, 100, 1);
+        CHECK(early_miss_map.insert(early_miss_ids[i], &early_miss_orders[i]) ==
+              Status::Accepted);
+    }
+
+    // Order id 28 also hashes to bucket four. The lookup stops at bucket zero
+    // when the resident's probe distance drops from three to zero, one slot
+    // before the following empty bucket.
+    CHECK(early_miss_map.find(28) == nullptr);
+    CHECK(early_miss_map.stats().last_probe_count == 5U);
+
+    // A completely full same-bucket cluster has no earlier proof of absence;
+    // the negative lookup is nevertheless capped at exactly table capacity.
+    constexpr std::array<OrderId, 8> full_ids{9, 19, 20, 24, 28, 39, 55, 59};
+    std::array<Order, full_ids.size()> full_orders{};
+    OrderIdMap full_map(8);
+    for (std::size_t i = 0; i < full_ids.size(); ++i) {
+        full_orders[i].reset(full_ids[i], Side::Sell, 101, 1);
+        CHECK(full_map.insert(full_ids[i], &full_orders[i]) == Status::Accepted);
+    }
+    CHECK(full_map.full());
+    CHECK(full_map.find(67) == nullptr);
+    CHECK(full_map.stats().last_probe_count == full_map.capacity());
+
+    // Reuse the located slot instead of probing for the id again. The one
+    // lookup sample is replaced by lookup-plus-seven-shift work, rather than
+    // adding a second histogram sample for erase.
+    const std::uint64_t samples_before = histogram_total(full_map.stats());
+    const OrderIdMap::EraseToken token = full_map.find_for_erase(full_ids[0]);
+    CHECK(token.order() == &full_orders[0]);
+    CHECK(full_map.erase(token));
+    const OrderIdMapStats erase_stats = full_map.stats();
+    CHECK(erase_stats.last_probe_count == full_map.capacity());
+    CHECK(histogram_total(erase_stats) == samples_before + 1U);
+    for (std::size_t i = 1; i < full_ids.size(); ++i) {
+        CHECK(full_map.find(full_ids[i]) == &full_orders[i]);
+    }
+}
+
+void test_cancel_best_level_dense_boundaries()
+{
+    const BookConfig config{-4'096, 4'095, 8, 16, 1, 32, PriceLevelMode::Dense};
+    OrderBook bid_book(config);
+    OrderBook ask_book(config);
+
+    CHECK(bid_book.add_limit_order(1, Side::Buy, -4'000, 1, 1).status ==
+          Status::Accepted);
+    CHECK(bid_book.add_limit_order(2, Side::Buy, 4'000, 1, 2).status ==
+          Status::Accepted);
+    CHECK(ask_book.add_limit_order(3, Side::Sell, -3'999, 1, 3).status ==
+          Status::Accepted);
+    CHECK(ask_book.add_limit_order(4, Side::Sell, 3'999, 1, 4).status ==
+          Status::Accepted);
+
+    // Removing the sole order at each best level forces dense occupancy-word
+    // discovery toward the opposite end of the configured 128-word bitset.
+    CHECK(bid_book.cancel_order(2, 5).status == Status::Cancelled);
+    CHECK(bid_book.best_bid().valid);
+    CHECK(bid_book.best_bid().price == -4'000);
+    CHECK(ask_book.cancel_order(3, 6).status == Status::Cancelled);
+    CHECK(ask_book.best_ask().valid);
+    CHECK(ask_book.best_ask().price == 3'999);
+}
+
+void test_cancel_sparse_final_level_maintains_sorted_slots()
+{
+    BookConfig config{1, 1'000'000, 8, 16, 1, 32, PriceLevelMode::Sparse};
+    OrderBook book(config);
+    constexpr std::array<Price, 8> prices{
+        10, 100'000, 200'000, 300'000, 400'000, 500'000, 600'000, 700'000};
+
+    for (std::size_t i = 0; i < prices.size(); ++i) {
+        CHECK(book.add_limit_order(static_cast<OrderId>(i + 1U),
+                                   Side::Buy,
+                                   prices[i],
+                                   1,
+                                   static_cast<Timestamp>(i + 1U))
+                  .status == Status::Accepted);
+    }
+    CHECK(book.stats().bids.occupied_level_count == prices.size());
+
+    // Every level has one order. Removing the lowest level shifts all seven
+    // following sorted-slot entries while leaving the cached best unchanged.
+    CHECK(book.cancel_order(1, 20).status == Status::Cancelled);
+    CHECK(book.depth_at_price(Side::Buy, prices[0]) == 0U);
+    CHECK(book.stats().bids.occupied_level_count == prices.size() - 1U);
+    CHECK(book.best_bid().valid);
+    CHECK(book.best_bid().price == prices.back());
+
+    // The released sparse level slot and a tombstoned map position remain
+    // reusable without disturbing sorted traversal.
+    CHECK(book.add_limit_order(9, Side::Buy, 50'000, 2, 21).status == Status::Accepted);
+    std::array<DepthLevel, 8> depth{};
+    CHECK(book.depth(Side::Buy, depth.size(), depth.data()) == depth.size());
+    CHECK(depth.front().price == prices.back());
+    CHECK(depth.back().price == 50'000);
+
+    CHECK(book.cancel_order(8, 22).status == Status::Cancelled);
+    CHECK(book.best_bid().valid);
+    CHECK(book.best_bid().price == prices[6]);
 }
 
 void test_book_and_engine_stats()
@@ -2838,6 +3125,114 @@ void test_invalid_and_unknown_inputs()
     run_add(actual, expected, 2, Side::Buy, 100, 10, 4);
     run_replace(actual, expected, 2, 100, 0);
     run_replace(actual, expected, 2, 101, 10);
+}
+
+void test_invalid_side_direct_api_invalidates_event_spans()
+{
+    const BookConfig config{90,
+                            110,
+                            16,
+                            64,
+                            1,
+                            32,
+                            PriceLevelMode::Dense,
+                            0,
+                            SelfTradePolicy::Disabled,
+                            32};
+    OrderBook book(config);
+    CHECK(book.add_limit_order(1, Side::Sell, 100, 5, 1).status == Status::Accepted);
+    CHECK(!book.last_events().empty());
+    CHECK(!book.last_market_data_events().empty());
+
+    const Side invalid_side = static_cast<Side>(0xffU);
+    const std::uint64_t checksum_before = book.state_checksum();
+    const std::uint32_t live_orders_before = book.live_order_count();
+    const Quantity ask_depth_before = book.depth_at_price(Side::Sell, 100);
+    const SequenceNumber fifo_sequence_before = book.fifo_sequence();
+    const SequenceNumber event_sequence_before = book.event_sequence();
+    const SequenceNumber market_data_sequence_before = book.market_data_sequence();
+
+    const AddOrderResult add = book.add_limit_order(2, invalid_side, 100, 5, 2);
+    CHECK(add.status == Status::InvalidCommand);
+    CHECK(add.accepted_quantity == 0U);
+    CHECK(add.events_emitted == 0U);
+    CHECK(add.events.empty());
+    CHECK(book.find_order(2) == nullptr);
+    CHECK(book.state_checksum() == checksum_before);
+    CHECK(book.live_order_count() == live_orders_before);
+    CHECK(book.depth_at_price(Side::Sell, 100) == ask_depth_before);
+    CHECK(book.last_events().empty());
+    CHECK(book.last_market_data_events().empty());
+    CHECK(book.fifo_sequence() == fifo_sequence_before);
+    CHECK(book.event_sequence() == event_sequence_before);
+    CHECK(book.market_data_sequence() == market_data_sequence_before);
+
+    CHECK(book.modify_order(1, 4, 3).status == Status::Accepted);
+    CHECK(!book.last_events().empty());
+    CHECK(!book.last_market_data_events().empty());
+    const std::uint64_t checksum_before_market = book.state_checksum();
+    const SequenceNumber fifo_sequence_before_market = book.fifo_sequence();
+    const SequenceNumber event_sequence_before_market = book.event_sequence();
+    const SequenceNumber market_data_sequence_before_market =
+        book.market_data_sequence();
+
+    const MatchResult market = book.match_market_order(invalid_side, 5, 3, 4);
+    CHECK(market.status == Status::InvalidCommand);
+    CHECK(market.requested_quantity == 5U);
+    CHECK(market.executed_quantity == 0U);
+    CHECK(market.remaining_quantity == 5U);
+    CHECK(market.fills == 0U);
+    CHECK(market.events_emitted == 0U);
+    CHECK(market.events.empty());
+    CHECK(book.state_checksum() == checksum_before_market);
+    CHECK(book.live_order_count() == live_orders_before);
+    CHECK(book.depth_at_price(Side::Sell, 100) == 4U);
+    CHECK(book.last_events().empty());
+    CHECK(book.last_market_data_events().empty());
+    CHECK(book.fifo_sequence() == fifo_sequence_before_market);
+    CHECK(book.event_sequence() == event_sequence_before_market);
+    CHECK(book.market_data_sequence() == market_data_sequence_before_market);
+}
+
+void test_invalid_market_quantity_preserves_requested_and_remaining()
+{
+    BookConfig config{90, 110, 8, 32, 1};
+    config.lot_size = 10;
+    OrderBook book(config);
+
+    const MatchResult zero = book.match_market_order(Side::Buy, 0, 10, 1);
+    CHECK(zero.status == Status::InvalidQuantity);
+    CHECK(zero.requested_quantity == 0U);
+    CHECK(zero.executed_quantity == 0U);
+    CHECK(zero.remaining_quantity == 0U);
+    CHECK(zero.events_emitted == 1U);
+
+    const MatchResult wrong_lot =
+        book.match_market_order(Side::Sell, 15, 11, 2);
+    CHECK(wrong_lot.status == Status::LotSizeViolation);
+    CHECK(wrong_lot.requested_quantity == 15U);
+    CHECK(wrong_lot.executed_quantity == 0U);
+    CHECK(wrong_lot.remaining_quantity == 15U);
+    CHECK(wrong_lot.events_emitted == 1U);
+
+    constexpr InstrumentId instrument_id = 88;
+    const InstrumentConfig instruments[] = {
+        InstrumentConfig{instrument_id, config},
+    };
+    MatchingEngine engine(instruments);
+    const MatchResult routed =
+        engine.match_market_order(instrument_id, Side::Buy, 15, 12, 3);
+    CHECK(routed.status == Status::LotSizeViolation);
+    CHECK(routed.requested_quantity == 15U);
+    CHECK(routed.remaining_quantity == 15U);
+
+    const Command command{
+        instrument_id, CommandOp::Market, 13, Side::Buy, 0, 15, TimeInForce::Ioc, 4};
+    const DispatchResult dispatched = engine.dispatch(command);
+    CHECK(dispatched.status == Status::LotSizeViolation);
+    CHECK(dispatched.requested_quantity == 15U);
+    CHECK(dispatched.executed_quantity == 0U);
+    CHECK(dispatched.remaining_quantity == 15U);
 }
 
 void test_event_single_fill()
@@ -3531,6 +3926,63 @@ void test_book_snapshot_round_trip_random_ops()
     check_book_snapshots_equal(restored, actual, "random_book_snapshot_round_trip");
 }
 
+void test_snapshot_round_trip_preserves_public_order_state()
+{
+    constexpr std::array<PriceLevelMode, 2> modes{
+        PriceLevelMode::Dense,
+        PriceLevelMode::Sparse,
+    };
+
+    for (const PriceLevelMode mode : modes) {
+        BookConfig config{90, 110, 8, 32, 1, 32, mode};
+        OrderBook source(config);
+        CHECK(source.add_limit_order(1, Side::Sell, 100, 3, 1).status ==
+              Status::Accepted);
+        CHECK(source.add_limit_order(2, Side::Buy, 100, 10, 2).status ==
+              Status::PartiallyFilled);
+        CHECK(source.match_market_order(Side::Sell, 2, 90, 3).status ==
+              Status::Filled);
+        CHECK(source.add_limit_order(3, Side::Sell, 105, 9, 4).status ==
+              Status::Accepted);
+        CHECK(source.modify_order(3, 4, 5).status == Status::Accepted);
+
+        const Order* const partially_filled = source.find_order(2);
+        CHECK(partially_filled != nullptr);
+        CHECK(partially_filled->quantity == 5U);
+        CHECK(partially_filled->initial_quantity == 7U);
+        CHECK(partially_filled->state == OrderState::PartiallyFilled);
+
+        const Order* const reduced = source.find_order(3);
+        CHECK(reduced != nullptr);
+        CHECK(reduced->quantity == 4U);
+        CHECK(reduced->initial_quantity == 9U);
+        CHECK(reduced->state == OrderState::Resting);
+
+        std::array<std::byte, kSnapshotTestBufferSize> buffer{};
+        const SnapshotWriteResult snapshot = serialize(source, buffer);
+        CHECK(snapshot.status == Status::Accepted);
+
+        OrderBook restored(config);
+        CHECK(restore(restored,
+                      std::span<const std::byte>(buffer.data(), snapshot.bytes_written)) ==
+              Status::Accepted);
+
+        const Order* const restored_partial = restored.find_order(2);
+        CHECK(restored_partial != nullptr);
+        CHECK(restored_partial->quantity == partially_filled->quantity);
+        CHECK(restored_partial->initial_quantity == partially_filled->initial_quantity);
+        CHECK(restored_partial->state == partially_filled->state);
+
+        const Order* const restored_reduced = restored.find_order(3);
+        CHECK(restored_reduced != nullptr);
+        CHECK(restored_reduced->quantity == reduced->quantity);
+        CHECK(restored_reduced->initial_quantity == reduced->initial_quantity);
+        CHECK(restored_reduced->state == reduced->state);
+        CHECK(restored.state_checksum() == source.state_checksum());
+        check_book_snapshots_equal(restored, source, "public_order_state_round_trip");
+    }
+}
+
 void test_book_snapshot_dense_and_sparse_round_trips_at_capacity()
 {
     constexpr PriceLevelMode modes[] = {
@@ -3841,6 +4293,11 @@ void test_snapshot_rejects_duplicate_and_inconsistent_records_atomically()
     constexpr std::size_t order_quantity_offset = order_price_offset + sizeof(Price);
     constexpr std::size_t order_sequence_offset =
         order_quantity_offset + sizeof(Quantity) + sizeof(Timestamp);
+    constexpr std::size_t order_initial_quantity_offset =
+        order_sequence_offset + sizeof(SequenceNumber) + sizeof(ParticipantId) +
+        sizeof(std::uint8_t);
+    constexpr std::size_t order_state_offset =
+        order_initial_quantity_offset + sizeof(Quantity);
     const std::size_t levels_offset =
         detail::kBookHeaderWireSize + 3U * detail::kBookOrderWireSize;
     constexpr std::size_t level_price_offset = sizeof(std::uint8_t);
@@ -3877,6 +4334,22 @@ void test_snapshot_rejects_duplicate_and_inconsistent_records_atomically()
                  detail::kBookHeaderWireSize + order_quantity_offset,
                  0);
     check_atomic_rejection(corrupted, "invalid_order_quantity_atomic_rejection");
+
+    corrupted = buffer;
+    write_u64_le(corrupted,
+                 detail::kBookHeaderWireSize + order_initial_quantity_offset,
+                 0);
+    check_atomic_rejection(corrupted, "invalid_initial_quantity_atomic_rejection");
+
+    corrupted = buffer;
+    corrupted[detail::kBookHeaderWireSize + order_state_offset] =
+        static_cast<std::byte>(static_cast<std::uint8_t>(OrderState::Filled));
+    check_atomic_rejection(corrupted, "non_resting_order_state_atomic_rejection");
+
+    corrupted = buffer;
+    corrupted[detail::kBookHeaderWireSize + order_state_offset] =
+        static_cast<std::byte>(static_cast<std::uint8_t>(OrderState::PartiallyFilled));
+    check_atomic_rejection(corrupted, "inconsistent_partial_state_atomic_rejection");
 
     corrupted = buffer;
     write_u64_le(corrupted,
@@ -4224,6 +4697,33 @@ void test_seeded_multi_instrument_conformance()
     return config;
 }
 
+template <typename Result>
+void check_stp_result_flags(const Result& result, const SelfTradePolicy policy)
+{
+    CHECK(result.aggressor_cancelled_by_stp ==
+          (policy == SelfTradePolicy::CancelAggressor ||
+           policy == SelfTradePolicy::CancelBoth));
+    CHECK(result.resting_orders_cancelled_by_stp ==
+          ((policy == SelfTradePolicy::CancelResting ||
+            policy == SelfTradePolicy::CancelBoth)
+               ? 1U
+               : 0U));
+}
+
+[[nodiscard]] constexpr Status expected_limit_stp_status(
+    const SelfTradePolicy policy) noexcept
+{
+    return policy == SelfTradePolicy::CancelResting ? Status::Accepted
+                                                    : Status::SelfTradePrevented;
+}
+
+[[nodiscard]] constexpr Status expected_market_stp_status(
+    const SelfTradePolicy policy) noexcept
+{
+    return policy == SelfTradePolicy::CancelResting ? Status::NoLiquidity
+                                                    : Status::SelfTradePrevented;
+}
+
 void test_lot_size_rules()
 {
     OrderBook book(venue_config(PriceLevelMode::Dense, 10), 801);
@@ -4284,6 +4784,8 @@ void check_stp_policy(const PriceLevelMode mode, const SelfTradePolicy policy)
     const AddOrderResult result =
         book.add_limit_order(2, Side::Buy, 100, 10, 2, TimeInForce::Gtc, 42);
 
+    check_stp_result_flags(result, policy);
+
     if (policy == SelfTradePolicy::Disabled) {
         CHECK(result.status == Status::Filled);
         CHECK(result.executed_quantity == 10);
@@ -4340,6 +4842,7 @@ void test_stp_partial_third_party_ioc_fok_and_fifo()
         const AddOrderResult result =
             book.add_limit_order(3, Side::Buy, 100, 10, 3, TimeInForce::Gtc, 42);
         CHECK(result.executed_quantity == 5);
+        check_stp_result_flags(result, policy);
         CHECK(book.find_order(1) == nullptr);
         if (policy == SelfTradePolicy::CancelAggressor) {
             CHECK(result.status == Status::PartiallyFilled);
@@ -4408,6 +4911,170 @@ void test_stp_partial_third_party_ioc_fok_and_fifo()
     CHECK(fifo.find_order(1) == nullptr);
     CHECK(fifo.find_order(2) == nullptr);
     CHECK(fifo.find_order(3) != nullptr);
+}
+
+void test_replace_preserves_stp_result_flags()
+{
+    constexpr SelfTradePolicy policies[]{
+        SelfTradePolicy::CancelAggressor,
+        SelfTradePolicy::CancelResting,
+        SelfTradePolicy::CancelBoth,
+    };
+
+    for (const PriceLevelMode mode : {PriceLevelMode::Dense, PriceLevelMode::Sparse}) {
+        for (const SelfTradePolicy policy : policies) {
+            OrderBook book(venue_config(mode, 1, policy, 128), 812);
+            CHECK(book.add_limit_order(1,
+                                       Side::Sell,
+                                       100,
+                                       10,
+                                       1,
+                                       TimeInForce::Gtc,
+                                       42)
+                      .status == Status::Accepted);
+            CHECK(book.add_limit_order(2,
+                                       Side::Buy,
+                                       99,
+                                       10,
+                                       2,
+                                       TimeInForce::Gtc,
+                                       42)
+                      .status == Status::Accepted);
+
+            const ReplaceResult result =
+                book.replace_order(2, 100, 10, 3, TimeInForce::Gtc);
+
+            CHECK(result.status == expected_limit_stp_status(policy));
+            CHECK(result.executed_quantity == 0U);
+            check_stp_result_flags(result, policy);
+        }
+    }
+}
+
+void test_dispatch_preserves_stp_result_flags()
+{
+    constexpr InstrumentId instrument_id = 813;
+    constexpr ParticipantId participant_id = 42;
+    constexpr SelfTradePolicy policies[]{
+        SelfTradePolicy::CancelAggressor,
+        SelfTradePolicy::CancelResting,
+        SelfTradePolicy::CancelBoth,
+    };
+
+    for (const SelfTradePolicy policy : policies) {
+        const BookConfig config =
+            venue_config(PriceLevelMode::Dense, 1, policy, 128);
+        const InstrumentConfig instruments[]{InstrumentConfig{instrument_id, config}};
+
+        {
+            MatchingEngine engine(instruments);
+            CHECK(engine
+                      .dispatch(VenueCommand{
+                          Command{instrument_id,
+                                  CommandOp::Add,
+                                  1,
+                                  Side::Sell,
+                                  100,
+                                  10,
+                                  TimeInForce::Gtc,
+                                  1},
+                          participant_id,
+                          false})
+                      .status == Status::Accepted);
+
+            const DispatchResult result = engine.dispatch(VenueCommand{
+                Command{instrument_id,
+                        CommandOp::Add,
+                        2,
+                        Side::Buy,
+                        100,
+                        10,
+                        TimeInForce::Gtc,
+                        2},
+                participant_id,
+                false});
+
+            CHECK(result.status == expected_limit_stp_status(policy));
+            check_stp_result_flags(result, policy);
+        }
+
+        {
+            MatchingEngine engine(instruments);
+            CHECK(engine
+                      .dispatch(VenueCommand{
+                          Command{instrument_id,
+                                  CommandOp::Add,
+                                  1,
+                                  Side::Sell,
+                                  100,
+                                  10,
+                                  TimeInForce::Gtc,
+                                  1},
+                          participant_id,
+                          false})
+                      .status == Status::Accepted);
+            CHECK(engine
+                      .dispatch(VenueCommand{
+                          Command{instrument_id,
+                                  CommandOp::Add,
+                                  2,
+                                  Side::Buy,
+                                  99,
+                                  10,
+                                  TimeInForce::Gtc,
+                                  2},
+                          participant_id,
+                          false})
+                      .status == Status::Accepted);
+
+            const DispatchResult result = engine.dispatch(Command{
+                instrument_id,
+                CommandOp::Replace,
+                2,
+                Side::Buy,
+                100,
+                10,
+                TimeInForce::Gtc,
+                3});
+
+            CHECK(result.status == expected_limit_stp_status(policy));
+            check_stp_result_flags(result, policy);
+        }
+
+        {
+            MatchingEngine engine(instruments);
+            CHECK(engine
+                      .dispatch(VenueCommand{
+                          Command{instrument_id,
+                                  CommandOp::Add,
+                                  1,
+                                  Side::Sell,
+                                  100,
+                                  10,
+                                  TimeInForce::Gtc,
+                                  1},
+                          participant_id,
+                          false})
+                      .status == Status::Accepted);
+
+            const DispatchResult result = engine.dispatch(VenueCommand{
+                Command{instrument_id,
+                        CommandOp::Market,
+                        2,
+                        Side::Buy,
+                        0,
+                        10,
+                        TimeInForce::Gtc,
+                        2},
+                participant_id,
+                false});
+
+            CHECK(result.status == expected_market_stp_status(policy));
+            CHECK(result.requested_quantity == 10U);
+            CHECK(result.remaining_quantity == 10U);
+            check_stp_result_flags(result, policy);
+        }
+    }
 }
 
 void test_market_data_ordering_sequences_gap_and_capacity()
@@ -4656,6 +5323,7 @@ int main()
     test_dispatch_failure_results_have_empty_events_and_preserve_books();
     test_event_log_full_policy();
     test_reference_oracle_models_price_level_quantity_overflow();
+    test_price_level_quantity_overflow_rejection_is_atomic();
     test_dispatch_seeded_replay_stream_matches_oracle();
     test_fifo_and_price_priority();
     test_reduce_keeps_priority_and_increase_rejects();
@@ -4672,8 +5340,14 @@ int main()
     test_order_id_map_full_preflight();
     test_order_id_map_capacity_for_saturates();
     test_order_id_map_probe_stats();
+    test_order_id_map_backward_shift_deletion();
+    test_order_id_map_robin_hood_early_miss_and_full_table_bound();
+    test_cancel_best_level_dense_boundaries();
+    test_cancel_sparse_final_level_maintains_sorted_slots();
     test_book_and_engine_stats();
     test_invalid_and_unknown_inputs();
+    test_invalid_side_direct_api_invalidates_event_spans();
+    test_invalid_market_quantity_preserves_requested_and_remaining();
     test_event_single_fill();
     test_event_multi_level_sweep();
     test_event_partial_fill_and_rest();
@@ -4689,6 +5363,7 @@ int main()
     test_matching_engine_depth_after_adds_cancels_and_matches();
     test_matching_engine_unknown_instrument_rejects_without_side_effects();
     test_book_snapshot_round_trip_random_ops();
+    test_snapshot_round_trip_preserves_public_order_state();
     test_book_snapshot_dense_and_sparse_round_trips_at_capacity();
     test_snapshot_restore_then_encoded_command_replay_is_deterministic();
     test_book_snapshot_continue_trading_matches_fresh();
@@ -4706,6 +5381,8 @@ int main()
     test_post_only_entry_and_replace();
     test_all_stp_policies_dense_and_sparse();
     test_stp_partial_third_party_ioc_fok_and_fifo();
+    test_replace_preserves_stp_result_flags();
+    test_dispatch_preserves_stp_result_flags();
     test_market_data_ordering_sequences_gap_and_capacity();
     test_checksum_dense_sparse_and_snapshot_sequence();
     test_journal_full_replay_snapshot_tail_and_corruption();

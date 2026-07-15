@@ -6,6 +6,12 @@ Eigen-Book keeps its original behavior when venue features are disabled:
 post-only. All checks return explicit `Status` values and run before mutation
 where an operation can be rejected.
 
+A GTC add or lose-priority replace whose residual would overflow the target
+same-side price aggregate returns `Status::PriceLevelQuantityOverflow`. This is
+preflighted before acceptance, matching, allocation, or sequence advancement.
+The synchronous rejection event uses reserved sequence zero, and no market-data
+event is emitted.
+
 ## Lot size
 
 `BookConfig::lot_size` is the quantity increment. Values zero and one disable
@@ -87,6 +93,12 @@ STP cancellation emits an `OrderCancelled` command event with
 `SelfTradePrevented`; one stopped after third-party fills returns
 `PartiallyFilled`.
 
+`AddOrderResult`, `ReplaceResult`, `MatchResult`, and the unified
+`DispatchResult` preserve the detailed outcome in
+`aggressor_cancelled_by_stp` and `resting_orders_cancelled_by_stp`. This lets a
+caller distinguish `CancelResting`, `CancelAggressor`, and `CancelBoth` even
+when the high-level status is shared with another matching outcome.
+
 ## Replace and priority summary
 
 | Change | Priority | Matching |
@@ -101,10 +113,17 @@ Modify remains reduction-only. Quantity increases through modify return
 
 ## Complexity and capacity
 
-Order-id lookup plus cancel unlink remains O(1). Dense best-price traversal is
-bounded by crossed occupancy words; sparse traversal is bounded by occupied
-levels, while sparse level insertion/removal can shift at most `max_orders`
-sorted slots. STP preflight and execution are bounded by crossed FIFO orders.
+The intrusive FIFO unlink during cancellation is O(1); the complete cancel is
+not claimed to be O(1). Order-id lookup and backward-shift erase are each
+bounded by the configured id-map capacity. Removing the final order at the
+dense best price can scan `ceil(config.price_level_count() / 64)` occupancy
+words. Sparse cancellation additionally probes the fixed sparse level map and,
+when deleting a level, can shift at most `occupied_levels - 1` sorted slots.
+The exact configured bounds are derived in
+[`architecture.md`](architecture.md#cancellation-complexity). Dense best-price
+traversal during matching is bounded by crossed occupancy words; sparse
+traversal is bounded by occupied levels. STP preflight and execution are
+bounded by crossed FIFO orders.
 
 All order objects, id-map entries, price levels, command events, and market-data
 events are preallocated. Event capacity is reserved before mutation. Market

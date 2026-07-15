@@ -15,6 +15,7 @@
 #include <cstring>
 #include <ctime>
 #include <limits>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -38,6 +39,7 @@ constexpr std::uint32_t kMaximumOperations = 1'000'000;
 constexpr std::uint32_t kSnapshotLiveOrders = 256;
 constexpr std::uint32_t kSnapshotRestoreCapacity = 4'096;
 constexpr std::uint32_t kSnapshotRestorePriceLevels = kSnapshotRestoreCapacity * 2U;
+constexpr std::uint32_t kClusteredMapHashMask = 63U;
 constexpr std::array<std::uint32_t, 4> kSnapshotRestoreSizes{64, 256, 1'024, 4'096};
 constexpr std::array<const char*, 4> kSnapshotRestoreNames{
     "Restore snapshot (64 orders)",
@@ -46,7 +48,7 @@ constexpr std::array<const char*, 4> kSnapshotRestoreNames{
     "Restore snapshot (4096 orders)",
 };
 constexpr std::uint32_t kWidePriceCount = 20;
-constexpr std::size_t kCoreBenchmarkCount = 15;
+constexpr std::size_t kCoreBenchmarkCount = 16;
 constexpr std::size_t kBenchmarkResultCount =
     kCoreBenchmarkCount + kSnapshotRestoreSizes.size();
 
@@ -67,9 +69,10 @@ struct BenchmarkResult final {
     double total_time_ms{0.0};
     double operations_per_second{0.0};
     double average_ns{0.0};
-    std::uint64_t p50_ns{0};
-    std::uint64_t p95_ns{0};
-    std::uint64_t p99_ns{0};
+    std::uint32_t latency_samples{0};
+    std::optional<std::uint64_t> p50_ns{};
+    std::optional<std::uint64_t> p95_ns{};
+    std::optional<std::uint64_t> p99_ns{};
 };
 
 struct RunContext final {
@@ -277,9 +280,12 @@ void print_run_context(const RunContext& context, const BenchmarkOptions& option
     std::printf("CMake: %s (%s)\n",
                 benchmark_build::kCMakeVersion,
                 benchmark_build::kCMakeGenerator);
+    std::printf("Git commit: %s\n", benchmark_build::kGitCommit);
+    std::printf("Git worktree (at configure): %s\n", benchmark_build::kGitWorktree);
     std::printf("Workload iterations: %u\n", options.iterations);
     std::printf("Operations per workload iteration: %u operations\n", options.operations);
     std::printf("Latency sampling: %u-operation blocks\n", kSampleBlockSize);
+    std::printf("Percentiles: nearest-rank over complete blocks; p50/p95/p99 require 2/20/100 samples\n");
     std::printf("Wide-price workload: %u occupied prices over [1, 1000000]\n", kWidePriceCount);
     std::printf("Snapshot serialize workload: %u live orders\n", kSnapshotLiveOrders);
     std::printf("Snapshot restore workloads: 64, 256, 1024, and 4096 live orders; one occupied level per order\n");
@@ -301,12 +307,15 @@ void print_run_context(const RunContext& context, const BenchmarkOptions& option
 template <typename Fn>
 [[nodiscard]] BenchmarkResult run_benchmark(const char* name, const std::uint32_t operations, Fn&& fn)
 {
-    const std::uint32_t sample_count = (operations + kSampleBlockSize - 1U) / kSampleBlockSize;
-    std::vector<std::uint64_t> latencies(sample_count);
+    const std::uint32_t block_count =
+        (operations + kSampleBlockSize - 1U) / kSampleBlockSize;
+    const std::uint32_t complete_sample_count = operations / kSampleBlockSize;
+    std::vector<std::uint64_t> latencies(complete_sample_count);
 
     const auto wall_start = Clock::now();
     std::uint32_t operation_index = 0;
-    for (std::uint32_t sample = 0; sample < sample_count; ++sample) {
+    std::uint32_t complete_sample_index = 0;
+    for (std::uint32_t block = 0; block < block_count; ++block) {
         const std::uint32_t block_begin = operation_index;
         const std::uint32_t block_end = std::min(operations, block_begin + kSampleBlockSize);
 
@@ -318,17 +327,32 @@ template <typename Fn>
 
         const auto block_ns = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(block_end_time - block_start).count());
-        latencies[sample] = block_ns / static_cast<std::uint64_t>(block_end - block_begin);
+        const std::uint32_t block_operations = block_end - block_begin;
+        if (block_operations == kSampleBlockSize) {
+            latencies[complete_sample_index] =
+                block_ns / static_cast<std::uint64_t>(block_operations);
+            ++complete_sample_index;
+        }
     }
     const auto wall_end = Clock::now();
 
+    if (complete_sample_index != latencies.size()) {
+        std::abort();
+    }
     std::sort(latencies.begin(), latencies.end());
     const auto wall_ns = static_cast<double>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(wall_end - wall_start).count());
 
-    const auto percentile = [&](const double p) noexcept {
-        const auto index = static_cast<std::uint32_t>((static_cast<double>(sample_count - 1U)) * p);
-        return latencies[index];
+    const auto percentile = [&](const std::uint32_t percentile_numerator,
+                                const std::uint32_t minimum_samples) noexcept
+        -> std::optional<std::uint64_t> {
+        if (latencies.size() < minimum_samples) {
+            return std::nullopt;
+        }
+        constexpr std::size_t denominator = 100U;
+        const std::size_t rank =
+            (latencies.size() * percentile_numerator + denominator - 1U) / denominator;
+        return latencies[rank - 1U];
     };
 
     BenchmarkResult result{};
@@ -337,9 +361,10 @@ template <typename Fn>
     result.total_time_ms = wall_ns / 1'000'000.0;
     result.operations_per_second = static_cast<double>(operations) / (wall_ns / 1'000'000'000.0);
     result.average_ns = wall_ns / static_cast<double>(operations);
-    result.p50_ns = percentile(0.50);
-    result.p95_ns = percentile(0.95);
-    result.p99_ns = percentile(0.99);
+    result.latency_samples = static_cast<std::uint32_t>(latencies.size());
+    result.p50_ns = percentile(50U, 2U);
+    result.p95_ns = percentile(95U, 20U);
+    result.p99_ns = percentile(99U, 100U);
     return result;
 }
 
@@ -494,6 +519,45 @@ template <typename Fn>
     }
 
     return run_benchmark("Cancel N orders", operations, [&](const std::uint32_t i) {
+        const CancelResult result = book.cancel_order(ids[i]);
+        if (result.status != Status::Cancelled) {
+            std::abort();
+        }
+    });
+}
+
+[[nodiscard]] constexpr std::uint64_t benchmark_splitmix64(std::uint64_t value) noexcept
+{
+    // This intentionally mirrors OrderIdMap's fixed hash so setup can create
+    // collision-heavy ids before the timed cancellation loop.
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31U);
+}
+
+[[nodiscard]] BenchmarkResult benchmark_clustered_map_cancels(const std::uint32_t operations)
+{
+    BookConfig config = make_config(operations + 16U);
+    config.order_id_map_capacity = operations;
+    OrderBook book(config);
+    std::vector<OrderId> ids(operations);
+
+    OrderId candidate = 1U;
+    for (std::uint32_t i = 0; i < operations; ++candidate) {
+        if ((benchmark_splitmix64(candidate) & kClusteredMapHashMask) != 0U) {
+            continue;
+        }
+
+        ids[i] = candidate;
+        const AddOrderResult result = book.add_limit_order(candidate, Side::Buy, 100, 100);
+        if (result.status != Status::Accepted) {
+            std::abort();
+        }
+        ++i;
+    }
+
+    return run_benchmark("Clustered hash-map cancels", operations, [&](const std::uint32_t i) {
         const CancelResult result = book.cancel_order(ids[i]);
         if (result.status != Status::Cancelled) {
             std::abort();
@@ -924,6 +988,7 @@ run_benchmark_iteration(const std::uint32_t operations)
     results[result_index++] = benchmark_dense_wide_sparse_prices(operations);
     results[result_index++] = benchmark_sparse_wide_sparse_prices(operations);
     results[result_index++] = benchmark_cancel_orders(operations);
+    results[result_index++] = benchmark_clustered_map_cancels(operations);
     results[result_index++] = benchmark_modify_orders(operations);
     results[result_index++] = benchmark_replace_orders(operations);
     results[result_index++] = benchmark_market_matches(operations);
@@ -949,15 +1014,36 @@ run_benchmark_iteration(const std::uint32_t operations)
 
 void print_result(const BenchmarkResult& result)
 {
-    std::printf("| %-29s | %10llu | %10.3f | %14.0f | %8.1f | %6llu | %6llu | %6llu |\n",
+    const auto format_percentile = [](char* const output,
+                                      const std::size_t capacity,
+                                      const std::optional<std::uint64_t> value) noexcept {
+        if (value.has_value()) {
+            std::snprintf(output,
+                          capacity,
+                          "%llu",
+                          static_cast<unsigned long long>(*value));
+        } else {
+            std::snprintf(output, capacity, "unavailable");
+        }
+    };
+
+    char p50[32]{};
+    char p95[32]{};
+    char p99[32]{};
+    format_percentile(p50, sizeof(p50), result.p50_ns);
+    format_percentile(p95, sizeof(p95), result.p95_ns);
+    format_percentile(p99, sizeof(p99), result.p99_ns);
+
+    std::printf("| %-29s | %10llu | %10.3f | %14.0f | %8.1f | %7u | %11s | %11s | %11s |\n",
                 result.name,
                 static_cast<unsigned long long>(result.operations),
                 result.total_time_ms,
                 result.operations_per_second,
                 result.average_ns,
-                static_cast<unsigned long long>(result.p50_ns),
-                static_cast<unsigned long long>(result.p95_ns),
-                static_cast<unsigned long long>(result.p99_ns));
+                result.latency_samples,
+                p50,
+                p95,
+                p99);
 }
 
 void print_text_iteration(const std::uint32_t iteration,
@@ -968,8 +1054,8 @@ void print_text_iteration(const std::uint32_t iteration,
                 iteration + 1U,
                 options.iterations,
                 options.operations);
-    std::printf("| Scenario                      | Operations | Total ms   | Ops/sec        | Avg ns   | p50 ns | p95 ns | p99 ns |\n");
-    std::printf("|-------------------------------|------------|------------|----------------|----------|--------|--------|--------|\n");
+    std::printf("| Scenario                      | Operations | Total ms   | Ops/sec        | Avg ns   | Samples | p50 ns      | p95 ns      | p99 ns      |\n");
+    std::printf("|-------------------------------|------------|------------|----------------|----------|---------|-------------|-------------|-------------|\n");
     for (const BenchmarkResult& result : results) {
         print_result(result);
     }
@@ -1057,6 +1143,22 @@ void print_json_key_u64(const std::uint32_t indent,
     std::printf(": %llu%s\n", static_cast<unsigned long long>(value), comma ? "," : "");
 }
 
+void print_json_key_optional_u64(const std::uint32_t indent,
+                                 const char* const key,
+                                 const std::optional<std::uint64_t> value,
+                                 const bool comma) noexcept
+{
+    print_json_indent(indent);
+    print_json_string(key);
+    if (value.has_value()) {
+        std::printf(": %llu%s\n",
+                    static_cast<unsigned long long>(*value),
+                    comma ? "," : "");
+    } else {
+        std::printf(": null%s\n", comma ? "," : "");
+    }
+}
+
 void print_json_key_double(const std::uint32_t indent,
                            const char* const key,
                            const double value,
@@ -1070,7 +1172,7 @@ void print_json_key_double(const std::uint32_t indent,
 void print_json_begin(const RunContext& context, const BenchmarkOptions& options) noexcept
 {
     std::printf("{\n");
-    print_json_key_string(2, "schema", "eigenbook.benchmark.v1", true);
+    print_json_key_string(2, "schema", "eigenbook.benchmark.v2", true);
     std::printf("  \"context\": {\n");
     print_json_key_string(4, "timestamp", context.timestamp, true);
     print_json_key_string(4, "cpu", context.cpu_model, true);
@@ -1082,9 +1184,16 @@ void print_json_begin(const RunContext& context, const BenchmarkOptions& options
     print_json_key_string(4, "optimization_flags", benchmark_build::kOptimizationFlags, true);
     print_json_key_string(4, "cmake_version", benchmark_build::kCMakeVersion, true);
     print_json_key_string(4, "cmake_generator", benchmark_build::kCMakeGenerator, true);
+    print_json_key_string(4, "git_commit", benchmark_build::kGitCommit, true);
+    print_json_key_string(4, "git_worktree", benchmark_build::kGitWorktree, true);
     print_json_key_u32(4, "operations", options.operations, true);
     print_json_key_u32(4, "iterations", options.iterations, true);
-    print_json_key_u32(4, "sampling_block_size", kSampleBlockSize, false);
+    print_json_key_u32(4, "sampling_block_size", kSampleBlockSize, true);
+    print_json_key_string(
+        4,
+        "percentile_rule",
+        "nearest-rank over complete blocks; p50/p95/p99 require 2/20/100 samples",
+        false);
     std::printf("  },\n");
     std::printf("  \"units\": {\n");
     print_json_key_string(4, "total_time_ms", "milliseconds", true);
@@ -1102,9 +1211,10 @@ void print_json_result(const BenchmarkResult& result, const bool comma) noexcept
     print_json_key_double(8, "total_time_ms", result.total_time_ms, true);
     print_json_key_double(8, "operations_per_second", result.operations_per_second, true);
     print_json_key_double(8, "average_ns", result.average_ns, true);
-    print_json_key_u64(8, "p50_ns", result.p50_ns, true);
-    print_json_key_u64(8, "p95_ns", result.p95_ns, true);
-    print_json_key_u64(8, "p99_ns", result.p99_ns, false);
+    print_json_key_u32(8, "latency_samples", result.latency_samples, true);
+    print_json_key_optional_u64(8, "p50_ns", result.p50_ns, true);
+    print_json_key_optional_u64(8, "p95_ns", result.p95_ns, true);
+    print_json_key_optional_u64(8, "p99_ns", result.p99_ns, false);
     std::printf("      }%s\n", comma ? "," : "");
 }
 
